@@ -1600,7 +1600,7 @@
 +}
 --- /dev/null
 +++ b/internal/service/empty_users_test.go
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,117 @@
 +package service
 +
 +import (
@@ -1705,6 +1705,17 @@
 +	s.applyUserUpdate(context.Background(), []model.UserSpec{}, "")
 +	if k.updateCalls != 1 || len(s.lastUsers) != 0 {
 +		t.Fatal("explicit empty snapshot not honored")
++	}
++}
++
++func TestDeltaAddCannotReassignAnotherUsersUUID(t *testing.T) {
++	k := &fakeKernel{running: true}
++	s := newTestService(k)
++	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
++	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "existing"}})
++	s.applyUserDelta(context.Background(), "add", []model.UserSpec{{ID: 2, UUID: "existing"}})
++	if k.addCalls != 0 || len(s.lastUsers) != 1 || s.lastUsers[0].ID != 1 {
++		t.Fatal("delta reassigned an existing identity")
 +	}
 +}
 --- a/internal/service/service.go
@@ -1837,7 +1848,7 @@
  	prevUsers, prevHash := s.prepareUserState(users)
  	added, removed, err := s.kernel.UpdateUsers(users)
  	if err != nil {
-@@ -803,9 +851,13 @@
+@@ -803,9 +851,17 @@
  		if deltaUsers == nil || len(deltaUsers) == 0 {
  			return
  		}
@@ -1846,13 +1857,18 @@
 +			return
 +		}
  		merged := mergeUsers(s.lastUsers, deltaUsers)
- 
+-
 -		if !s.ensureRunning() {
++		if !validUserSnapshot(merged) {
++			nlog.Core().Warn("ignoring ambiguous merged user set")
++			return
++		}
++
 +		if s.applyStoppedUserSet(merged) {
  			return
  		}
  
-@@ -819,6 +871,12 @@
+@@ -819,6 +875,12 @@
  		}
  
  		prevUsers, prevHash := s.prepareUserState(merged)
@@ -1865,7 +1881,7 @@
  		added, err := s.kernel.AddUsers(deltaUsers)
  		if err != nil {
  			nlog.Core().Warn(fmt.Sprintf("AddUsers failed: %v, falling back to UpdateUsers", err))
-@@ -833,6 +891,7 @@
+@@ -833,6 +895,7 @@
  		}
  
  	case "remove":
@@ -1873,7 +1889,7 @@
  		// Defensive check for empty or nil deltaUsers
  		if deltaUsers == nil || len(deltaUsers) == 0 {
  			return
-@@ -840,6 +899,7 @@
+@@ -840,6 +903,7 @@
  		filtered := subtractUsers(s.lastUsers, deltaUsers)
  
  		if !s.kernel.IsRunning() {
@@ -1881,7 +1897,7 @@
  			return
  		}
  
-@@ -942,9 +1002,6 @@
+@@ -942,9 +1006,6 @@
  }
  
  func (s *Service) trackAndEnforce(ctx context.Context) {
@@ -1891,7 +1907,7 @@
  
  	traffic, aliveIPs, connCount, err := s.kernel.GetUserTraffic(ctx)
  	if err != nil {
-@@ -952,7 +1009,14 @@
+@@ -952,7 +1013,14 @@
  		return
  	}
  
@@ -1907,7 +1923,7 @@
  
  	// Only log stats if there's actual traffic or connections
  	if connCount > 0 || len(traffic) > 0 {
-@@ -980,6 +1044,7 @@
+@@ -980,6 +1048,7 @@
  		return
  	}
  
@@ -1915,7 +1931,7 @@
  	traffic := s.tracker.FlushTraffic()
  	aliveIPs := s.tracker.SnapshotAliveIPs()
  	online := s.tracker.CurrentOnline()
-@@ -988,7 +1053,13 @@
+@@ -988,7 +1057,13 @@
  	metrics["kernel_status"] = s.kernel.IsRunning()
  
  	go func() {
@@ -1929,7 +1945,7 @@
  		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
  			nlog.Core().Warn("failed to push report", "error", err)
  			if len(traffic) > 0 {
-@@ -1001,16 +1072,26 @@
+@@ -1001,16 +1076,26 @@
  			return
  		}
  		s.pushBackoff.onSuccess()
@@ -1956,7 +1972,7 @@
  	aliveIPs := s.tracker.SnapshotAliveIPs()
  	online := s.tracker.CurrentOnline()
  	status := monitor.Collect()
-@@ -1018,7 +1099,10 @@
+@@ -1018,7 +1103,10 @@
  	metrics["kernel_status"] = s.kernel.IsRunning()
  
  	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
@@ -1968,7 +1984,7 @@
  	}
  }
  
-@@ -1042,6 +1126,9 @@
+@@ -1042,6 +1130,9 @@
  	m["total_connections"] = s.tracker.TotalConnections()
  	m["active_users"] = len(online)
  	m["total_users"] = len(lastUsers)
