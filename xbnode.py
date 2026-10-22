@@ -595,6 +595,11 @@ def retention_plan(keep_releases=2, keep_snapshots=3, pins=(), proc=Path('/proc'
         groups.setdefault(meta['node_id'], []).append(key)
     for keys in groups.values():
         protected_snapshots.update(sorted(keys, reverse=True)[:keep_snapshots])
+        successful = [key for key in keys if snapshots[key][1].get('last_ready') is True]
+        if successful:
+            protected_snapshots.add(max(successful))
+        # Missing legacy readiness evidence is not permission to discard it.
+        protected_snapshots.update(key for key in keys if 'last_ready' not in snapshots[key][1])
     for key in protected_snapshots:
         protected_versions.add(snapshots[key][1]['release'])
     def version_key(value):

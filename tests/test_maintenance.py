@@ -45,7 +45,7 @@ class MaintenanceTests(unittest.TestCase):
                 for version in ('v0.1.0','v0.1.1','v0.1.2','v0.2.0','v0.3.0'):
                     (lib/'releases'/version).mkdir()
                 for name,version in [('41-a','v0.1.0'),('41-b','v0.1.1'),('41-c','v0.1.2')]:
-                    path=etc/'backups'/name;path.mkdir();(path/'node.json').write_text(json.dumps({'node_id':41,'release':version,'previous':None}))
+                    path=etc/'backups'/name;path.mkdir();(path/'node.json').write_text(json.dumps({'node_id':41,'release':version,'previous':None,'last_ready':False}))
                 node=etc/'node-41';node.mkdir();(node/'node.json').write_text(json.dumps({'node_id':41,'release':'v0.3.0','previous':str(etc/'backups/41-a')}))
                 (units/'xbnode-42.service').write_text('ExecStart='+str(lib/'releases/v0.2.0/xboard-node'))
                 plan=xb.retention_plan(1,1,proc=proc)
@@ -76,3 +76,17 @@ class MaintenanceTests(unittest.TestCase):
                 node.write_text(json.dumps({'node_id':1,'release':'v0.2.0','previous':None}))
                 plan=xb.retention_plan(1,1,('v0.1.0',),proc=proc)
                 self.assertEqual(plan['candidates'],[])
+
+    def test_last_successful_snapshot_survives_newer_failed_snapshots(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);etc=root/'etc';lib=root/'lib';units=root/'units';proc=root/'proc'
+            for p in (etc/'backups',etc/'node-41',lib/'releases',units,proc):p.mkdir(parents=True,exist_ok=True)
+            (etc/'node-41/node.json').write_text(json.dumps({'node_id':41,'release':'v0.2.1','previous':None}))
+            for name,ready,version in [('41-a',True,'v0.1.0'),('41-b',False,'v0.1.1'),('41-c',False,'v0.2.0')]:
+                p=etc/'backups'/name;p.mkdir();(p/'node.json').write_text(json.dumps({'node_id':41,'release':version,'previous':None,'last_ready':ready}));(lib/'releases'/version).mkdir()
+            (lib/'releases/v0.2.1').mkdir()
+            with patch.object(xb,'ROOT',etc),patch.object(xb,'LIB',lib),patch.object(xb,'UNITS',units):
+                plan=xb.retention_plan(1,1,proc=proc)
+            self.assertNotIn(str(etc/'backups/41-a'),plan['candidates'])
+            self.assertNotIn(str(lib/'releases/v0.1.0'),plan['candidates'])
+            self.assertIn(str(etc/'backups/41-b'),plan['candidates'])
