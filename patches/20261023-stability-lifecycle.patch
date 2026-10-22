@@ -1600,7 +1600,7 @@
 +}
 --- /dev/null
 +++ b/internal/service/empty_users_test.go
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,106 @@
 +package service
 +
 +import (
@@ -1608,6 +1608,7 @@
 +	"errors"
 +	"github.com/cedar2025/xboard-node/internal/model"
 +	"testing"
++	"time"
 +)
 +
 +func TestAuthoritativeUsersResumeStoppedEmptyKernel(t *testing.T) {
@@ -1637,11 +1638,16 @@
 +	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
 +	users := []model.UserSpec{{ID: 1, UUID: "new-user"}}
 +	s.applyUserUpdate(context.Background(), users, "")
-+	if k.running || len(s.lastUsers) != 0 {
-+		t.Fatal("failed start committed new state")
++	if k.running || len(s.lastUsers) != 1 {
++		t.Fatal("authoritative state was lost after failed start")
++	}
++	s.ensureRunning()
++	if k.startCalls != 1 {
++		t.Fatal("failed starts not rate limited")
 +	}
 +	k.startErr = nil
-+	s.applyUserUpdate(context.Background(), users, "")
++	s.nextKernelStart = time.Now().Add(-time.Second)
++	s.ensureRunning()
 +	if !k.running || k.startCalls != 2 {
 +		t.Fatal("same payload did not retry")
 +	}
@@ -1664,17 +1670,65 @@
 +		t.Fatal("later add did not resume")
 +	}
 +}
++
++func TestRemovalWhileStartPendingCannotResurrectUser(t *testing.T) {
++	k := &fakeKernel{startErr: errors.New("fail")}
++	s := newTestService(k)
++	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
++	users := []model.UserSpec{{ID: 1, UUID: "synthetic"}}
++	s.applyUserUpdate(context.Background(), users, "")
++	s.applyUserDelta(context.Background(), "remove", users)
++	k.startErr = nil
++	s.nextKernelStart = time.Now().Add(-time.Second)
++	s.ensureRunning()
++	if k.running || len(s.lastUsers) != 0 || k.startCalls != 1 {
++		t.Fatal("removed pending user resurrected")
++	}
++}
++
++func TestMalformedSnapshotsNeverMeanRevokeAll(t *testing.T) {
++	cases := [][]model.UserSpec{nil, {{ID: 0, UUID: ""}}, {{ID: 1, UUID: "one"}, {ID: 1, UUID: "other"}}, {{ID: 1, UUID: "same"}, {ID: 2, UUID: "same"}}}
++	for _, users := range cases {
++		k := &fakeKernel{running: true}
++		s := newTestService(k)
++		s.lastConfig = &model.NodeSpec{Protocol: "vless"}
++		s.updateUserState([]model.UserSpec{{ID: 99, UUID: "valid"}})
++		s.applyUserUpdate(context.Background(), users, "")
++		if k.updateCalls != 0 || k.removeCalls != 0 || len(s.lastUsers) != 1 || s.lastUsers[0].ID != 99 {
++			t.Fatal("malformed snapshot altered authority")
++		}
++	}
++	k := &fakeKernel{running: true}
++	s := newTestService(k)
++	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
++	s.updateUserState([]model.UserSpec{{ID: 99, UUID: "valid"}})
++	s.applyUserUpdate(context.Background(), []model.UserSpec{}, "")
++	if k.updateCalls != 1 || len(s.lastUsers) != 0 {
++		t.Fatal("explicit empty snapshot not honored")
++	}
++}
 --- a/internal/service/service.go
 +++ b/internal/service/service.go
-@@ -60,6 +60,7 @@
- 	pushBackoff    apiBackoff // backoff for panel push failures
+@@ -54,12 +54,14 @@
+ 	pushInterval int // seconds
+ 	pullInterval int // seconds
+ 
+-	lastUserHash   string     // hash of user list for change detection
+-	lastConfigHash string     // hash of full config for change detection
+-	pullBackoff    apiBackoff // backoff for panel pull failures
+-	pushBackoff    apiBackoff // backoff for panel push failures
++	nextKernelStart time.Time  // failed starts retry at most once per 30s on the normal track tick
++	lastUserHash    string     // hash of user list for change detection
++	lastConfigHash  string     // hash of full config for change detection
++	pullBackoff     apiBackoff // backoff for panel pull failures
++	pushBackoff     apiBackoff // backoff for panel push failures
  
  	// pushActive prevents overlapping push/pull goroutines.
 +	reportMu   sync.Mutex // serializes outbox/report and shutdown flush
  	pushActive atomic.Bool
  	pullActive atomic.Bool
  	// pullResults delivers async pullViaAPI results back to the main goroutine.
-@@ -169,6 +170,9 @@
+@@ -169,6 +171,9 @@
  }
  
  func (s *Service) Run(ctx context.Context) error {
@@ -1684,7 +1738,7 @@
  	// Start cert manager (handles auto-TLS or manual cert verification)
  	if err := s.cert.Start(ctx); err != nil {
  		return fmt.Errorf("cert manager: %w", err)
-@@ -205,6 +209,8 @@
+@@ -205,10 +210,13 @@
  	for {
  		select {
  		case <-ctx.Done():
@@ -1693,10 +1747,63 @@
  			s.pushReportSync()
  			return nil
  
-@@ -770,13 +776,30 @@
+ 		case <-trackTicker.C:
++			s.ensureRunning()
+ 			s.trackAndEnforce(ctx)
+ 
+ 		case <-reportTicker.C:
+@@ -292,6 +300,9 @@
+ 		return err
+ 	}
+ 
++	if !validUserSnapshot(bootstrap.Users) {
++		return fmt.Errorf("invalid initial user snapshot")
++	}
+ 	s.metricsMu.Lock()
+ 	s.lastConfig = bootstrap.Config
+ 	s.metricsMu.Unlock()
+@@ -737,10 +748,12 @@
+ // records the successfully applied state. Returns false on error.
+ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
+ 	if err := s.kernel.Start(nc, users, s.cert.TLSCert()); err != nil {
++		s.nextKernelStart = time.Now().Add(30 * time.Second)
+ 		nlog.Core().Error("failed to start kernel", "error", err)
+ 		return false
+ 	}
+ 
++	s.nextKernelStart = time.Time{}
+ 	s.appliedState.Config = nc
+ 	s.appliedState.Users = users
+ 
+@@ -762,21 +775,56 @@
+ 	if s.kernel.IsRunning() {
+ 		return true
+ 	}
+-	if len(s.lastUsers) > 0 && s.lastConfig != nil {
++	if len(s.lastUsers) > 0 && s.lastConfig != nil && !time.Now().Before(s.nextKernelStart) {
+ 		return s.startKernel(s.lastConfig, s.lastUsers)
+ 	}
+ 	return false
+ }
  
  // ─── User update entry points ───────────────────────────────────────────────
- 
++
++// Reject malformed/ambiguous success bodies before treating them as an
++// authoritative replacement. An explicit empty array is valid revocation;
++// missing data, missing identity, or duplicate identity is not that signal.
++func validUserSnapshot(users []model.UserSpec) bool {
++	ids := make(map[int]bool, len(users))
++	uuids := make(map[string]bool, len(users))
++	for _, u := range users {
++		if u.ID <= 0 || strings.TrimSpace(u.UUID) == "" || ids[u.ID] || uuids[u.UUID] {
++			return false
++		}
++		ids[u.ID] = true
++		uuids[u.UUID] = true
++	}
++	return true
++}
++
 +// A valid set received while there are no users/config must become the
 +// next startup state. ensureRunning() only sees the previous set and cannot
 +// bootstrap a kernel after its last user was removed.
@@ -1704,15 +1811,13 @@
 +	if s.kernel.IsRunning() {
 +		return false
 +	}
-+	previous, hash := s.prepareUserState(users)
-+	if s.lastConfig != nil && len(users) > 0 {
-+		if !s.startKernel(s.lastConfig, users) {
-+			s.restoreUserState(previous, hash)
-+		}
-+	}
++	// Keep the successful control-plane response even when startup fails: a
++	// subsequent 304 must not erase the only usable authoritative user set.
++	s.prepareUserState(users)
++	s.ensureRunning()
 +	return true
 +}
-+
+ 
  // applyUserUpdate replaces the full user set and hot-swaps the kernel.
  // Called from WS sync.users and REST polling.
  func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, newHash string) {
@@ -1720,6 +1825,10 @@
 -		return
 -	}
 -
++	if users == nil || !validUserSnapshot(users) {
++		nlog.Core().Warn("ignoring missing or invalid user snapshot")
++		return
++	}
 +	if s.applyStoppedUserSet(users) {
 +		return
 +	}
@@ -1728,8 +1837,14 @@
  	prevUsers, prevHash := s.prepareUserState(users)
  	added, removed, err := s.kernel.UpdateUsers(users)
  	if err != nil {
-@@ -805,7 +828,7 @@
+@@ -803,9 +851,13 @@
+ 		if deltaUsers == nil || len(deltaUsers) == 0 {
+ 			return
  		}
++		if !validUserSnapshot(deltaUsers) {
++			nlog.Core().Warn("ignoring invalid user add event")
++			return
++		}
  		merged := mergeUsers(s.lastUsers, deltaUsers)
  
 -		if !s.ensureRunning() {
@@ -1737,7 +1852,7 @@
  			return
  		}
  
-@@ -819,6 +842,12 @@
+@@ -819,6 +871,12 @@
  		}
  
  		prevUsers, prevHash := s.prepareUserState(merged)
@@ -1750,7 +1865,7 @@
  		added, err := s.kernel.AddUsers(deltaUsers)
  		if err != nil {
  			nlog.Core().Warn(fmt.Sprintf("AddUsers failed: %v, falling back to UpdateUsers", err))
-@@ -833,6 +862,7 @@
+@@ -833,6 +891,7 @@
  		}
  
  	case "remove":
@@ -1758,7 +1873,7 @@
  		// Defensive check for empty or nil deltaUsers
  		if deltaUsers == nil || len(deltaUsers) == 0 {
  			return
-@@ -840,6 +870,7 @@
+@@ -840,6 +899,7 @@
  		filtered := subtractUsers(s.lastUsers, deltaUsers)
  
  		if !s.kernel.IsRunning() {
@@ -1766,7 +1881,7 @@
  			return
  		}
  
-@@ -942,9 +973,6 @@
+@@ -942,9 +1002,6 @@
  }
  
  func (s *Service) trackAndEnforce(ctx context.Context) {
@@ -1776,7 +1891,7 @@
  
  	traffic, aliveIPs, connCount, err := s.kernel.GetUserTraffic(ctx)
  	if err != nil {
-@@ -952,7 +980,14 @@
+@@ -952,7 +1009,14 @@
  		return
  	}
  
@@ -1792,7 +1907,7 @@
  
  	// Only log stats if there's actual traffic or connections
  	if connCount > 0 || len(traffic) > 0 {
-@@ -980,6 +1015,7 @@
+@@ -980,6 +1044,7 @@
  		return
  	}
  
@@ -1800,7 +1915,7 @@
  	traffic := s.tracker.FlushTraffic()
  	aliveIPs := s.tracker.SnapshotAliveIPs()
  	online := s.tracker.CurrentOnline()
-@@ -988,7 +1024,13 @@
+@@ -988,7 +1053,13 @@
  	metrics["kernel_status"] = s.kernel.IsRunning()
  
  	go func() {
@@ -1814,7 +1929,7 @@
  		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
  			nlog.Core().Warn("failed to push report", "error", err)
  			if len(traffic) > 0 {
-@@ -1001,16 +1043,26 @@
+@@ -1001,16 +1072,26 @@
  			return
  		}
  		s.pushBackoff.onSuccess()
@@ -1841,7 +1956,7 @@
  	aliveIPs := s.tracker.SnapshotAliveIPs()
  	online := s.tracker.CurrentOnline()
  	status := monitor.Collect()
-@@ -1018,7 +1070,10 @@
+@@ -1018,7 +1099,10 @@
  	metrics["kernel_status"] = s.kernel.IsRunning()
  
  	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
@@ -1853,7 +1968,7 @@
  	}
  }
  
-@@ -1042,6 +1097,9 @@
+@@ -1042,6 +1126,9 @@
  	m["total_connections"] = s.tracker.TotalConnections()
  	m["active_users"] = len(online)
  	m["total_users"] = len(lastUsers)
