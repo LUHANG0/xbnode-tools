@@ -151,9 +151,13 @@ def main():
         deadline=time.monotonic()+45
         while True:
             try:initial=health(a.sha256,switched);break
-            except (AssertionError,OSError,RuntimeError):
+            except (AssertionError,OSError,RuntimeError) as error:
+                fatal=('fatal/startup journal entry','non-root service contract changed','process is root','unexpected extra listener','running program hash mismatch')
+                state=properties()
+                if str(error) in fatal or state.get('ActiveState')=='failed' or int(state.get('NRestarts','0'))>0:raise
                 if time.monotonic()>=deadline:raise
                 time.sleep(1)
+        assert initial['restarts']==0,'startup restarted unexpectedly'
         result['switch_seconds']=round(time.time()-switched,3);result['initial']=initial;save();print(json.dumps({'switched':True,'pid':initial['pid'],'switch_seconds':result['switch_seconds']}),flush=True)
         started=time.monotonic()
         while time.monotonic()-started<a.observe_seconds:

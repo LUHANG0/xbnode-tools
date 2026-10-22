@@ -16,6 +16,7 @@ import uuid
 
 spec=importlib.util.spec_from_file_location('fixture',Path(__file__).with_name('protocol_smoke.py'))
 f=importlib.util.module_from_spec(spec);spec.loader.exec_module(f)
+offline_mode="http503"
 state={};reports={};expected={};expected_lock=threading.Lock();stop_holds=threading.Event()
 class CountWriter:
     def __init__(self,inner):self.inner=inner;self.count=0
@@ -36,6 +37,7 @@ class Handler(f.Handler):
             return
         args=urllib.parse.parse_qs(parsed.query);node=int(args['node_id'][0]);s=state[node]
         if s['offline']:
+            if offline_mode=='disconnect':self.close_connection=True;self.connection.close();return
             self.send_error(503);return
         if parsed.path.endswith('/config'):self.reply(s['definition'])
         elif parsed.path.endswith('/user'):self.reply({'users':s['users']})
@@ -46,6 +48,7 @@ class Handler(f.Handler):
             self.reply({'websocket':{'enabled':False},'settings':{'push_interval':5,'pull_interval':2}});return
         args=urllib.parse.parse_qs(parsed.query);node=int(json.loads(raw).get('node_id',0));s=state.get(node)
         if s and s['report_offline']:
+            if offline_mode=='disconnect':self.close_connection=True;self.connection.close();return
             self.send_error(503);return
         if parsed.path.endswith('/report') and s:
             value=json.loads(raw);reports[node]['batches']+=1;reports[node]['kernel_objects']=value.get('metrics',{}).get('kernel_objects');reports[node]['active_connections']=value.get('metrics',{}).get('active_connections')
@@ -68,7 +71,8 @@ def memory(pid):
     return r
 
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument('--baseline',required=True);ap.add_argument('--candidate',required=True);ap.add_argument('--client',required=True);ap.add_argument('--seconds',type=int,default=1800);ap.add_argument('--output',type=Path,required=True);a=ap.parse_args()
+    ap=argparse.ArgumentParser();ap.add_argument('--baseline',required=True);ap.add_argument('--candidate',required=True);ap.add_argument('--client',required=True);ap.add_argument('--seconds',type=int,default=1800);ap.add_argument('--output',type=Path,required=True);ap.add_argument('--offline-mode',choices=['http503','disconnect'],default='http503');a=ap.parse_args()
+    global offline_mode;offline_mode=a.offline_mode
     assert Path('/.dockerenv').exists();assert not any(line.split()[1]=='00000000' for line in Path('/proc/net/route').read_text().splitlines()[1:]);assert subprocess.check_output(['uname','-m'],text=True).strip()=='aarch64'
     server=Server(('127.0.0.1',0),Handler);threading.Thread(target=server.serve_forever,daemon=True).start();api=server.server_address[1]
     processes=[];clients=[];cases=[];records=[];success={};failures={};started=time.monotonic()
@@ -124,7 +128,7 @@ def main():
             assert success[c['label']]>a.seconds and failures[c['label']]==0,(c['label'],success,failures)
             assert reports[c['node']]['batches']>0 and reports[c['node']]['bytes']>0,reports
             assert reports[c['node']]['bytes']==expected[c['node']],(c['label'],reports[c['node']],expected[c['node']])
-        result={'complete':True,'pass':True,'duration_seconds':round(time.monotonic()-started,2),'native_arch':'aarch64','network_isolated':True,'synthetic_only':True,'cycles':cycle,'users_per_generation':251,'samples':records,'success':success,'failures':failures,'reports':reports,'expected_bytes':expected}
+        result={'complete':True,'pass':True,'duration_seconds':round(time.monotonic()-started,2),'offline_mode':a.offline_mode,'native_arch':'aarch64','network_isolated':True,'synthetic_only':True,'cycles':cycle,'users_per_generation':251,'samples':records,'success':success,'failures':failures,'reports':reports,'expected_bytes':expected}
         a.output.write_text(json.dumps(result,indent=2));print(json.dumps({'event':'complete','pass':True,'duration_seconds':result['duration_seconds'],'success':success}),flush=True)
     finally:
       for p in clients+processes:f.stop(p)
