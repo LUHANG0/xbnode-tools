@@ -1,0 +1,237 @@
+diff --git a/internal/kernel/xray/dispatcher.go b/internal/kernel/xray/dispatcher.go
+--- a/internal/kernel/xray/dispatcher.go
++++ b/internal/kernel/xray/dispatcher.go
+@@ -69,7 +69,7 @@
+ 	innerDisp routing.Dispatcher // same object, typed as Dispatcher
+ 
+ 	// limitedUsers: users with device limit > 0, protected by mu.
+-	// Needs deterministic IP ordering for kick decisions.
++	// New IP admission and reference reservation share this lock.
+ 	mu           sync.RWMutex
+ 	limitedIPs   map[string]map[string]int // email → sourceIP → refcount
+ 	deviceLimits map[string]int            // email → max devices
+@@ -109,14 +109,14 @@
+ 
+ 	link, err := d.innerDisp.Dispatch(ctx, dest)
+ 	if err != nil {
+-		if email != "" && isTCP {
++		if email != "" {
+ 			d.delConn(email, sourceIP)
+ 		}
+ 		return nil, err
+ 	}
+ 
+ 	if email != "" {
+-		d.trackLink(link, email, sourceIP, isTCP)
++		d.trackLink(ctx, link, email, sourceIP, isTCP)
+ 	}
+ 	return link, nil
+ }
+@@ -127,10 +127,15 @@
+ 		return err
+ 	}
+ 
++	var release func()
+ 	if email != "" {
+-		d.trackLink(link, email, sourceIP, isTCP)
+-	}
+-	return d.innerDisp.DispatchLink(ctx, dest, link)
++		release = d.trackLink(ctx, link, email, sourceIP, isTCP)
++	}
++	err = d.innerDisp.DispatchLink(ctx, dest, link)
++	if err != nil && release != nil {
++		release()
++	}
++	return err
+ }
+ 
+ // identifyAndCheck extracts user identity from the session context, enforces
+@@ -155,20 +160,26 @@
+ // trackLink records connection lifecycle without mutating xray-core owned
+ // transport primitives. This keeps mux/XUDP compatible while still allowing
+ // the dispatcher to release device-limit state when the link closes.
+-func (d *LimitDispatcher) trackLink(link *transport.Link, email, sourceIP string, isTCP bool) {
++func (d *LimitDispatcher) trackLink(ctx context.Context, link *transport.Link, email, sourceIP string, _ bool) func() {
+ 	d.connCount.Add(1)
+-
++	var once sync.Once
++	release := func() {
++		once.Do(func() {
++			d.delConn(email, sourceIP)
++			d.connCount.Add(-1)
++		})
++	}
++	// Some inbound bridges (notably Shadowsocks 2022) do not close the
++	// returned link writer. Their worker context still ends with the session.
++	// Preserve the concrete reader required by mux/XUDP and release once on
++	// either writer close/interrupt or context cancellation.
++	stop := context.AfterFunc(ctx, release)
+ 	onClose := func() {
+-		if isTCP {
+-			d.delConn(email, sourceIP)
+-		}
+-		d.connCount.Add(-1)
+-	}
+-
+-	link.Writer = &closeTrackingWriter{
+-		Writer:  link.Writer,
+-		onClose: onClose,
+-	}
++		stop()
++		release()
++	}
++	link.Writer = &closeTrackingWriter{Writer: link.Writer, onClose: onClose}
++	return onClose
+ }
+ 
+ // ─── features.Feature (delegated) ───────────────────────────────────────────
+@@ -270,22 +281,18 @@
+ 
+ // checkDeviceLimit enforces per-user device limits.
+ // Fast path: unlimited users use lock-free sync.Map.
+-// Slow path: limited users use RWMutex with deterministic IP ordering.
+-func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) bool {
++// Both TCP and UDP reserve a reference until their tracked flow ends.
++func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, _ bool) bool {
+ 	d.mu.RLock()
+ 	limit, hasLimit := d.deviceLimits[email]
+ 	d.mu.RUnlock()
+ 
+-	// Fast path: no device limit — use lock-free sync.Map.
++	// Fast path: no device limit — retain traffic-independent IP tracking.
+ 	if !hasLimit || limit <= 0 {
+-		if isTCP {
+-			v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
+-			ic := v.(*ipCounter)
+-
+-			// Increment IP refcount atomically.
+-			rv, _ := ic.ips.LoadOrStore(sourceIP, &atomic.Int64{})
+-			rv.(*atomic.Int64).Add(1)
+-		}
++		v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
++		ic := v.(*ipCounter)
++		rv, _ := ic.ips.LoadOrStore(sourceIP, &atomic.Int64{})
++		rv.(*atomic.Int64).Add(1)
+ 		return false
+ 	}
+ 
+@@ -301,16 +308,12 @@
+ 	}
+ 
+ 	if ips[sourceIP] > 0 {
+-		if isTCP {
+-			ips[sourceIP]++
+-		}
++		ips[sourceIP]++
+ 		return false
+ 	}
+ 
+ 	if len(ips) < limit {
+-		if isTCP {
+-			ips[sourceIP]++
+-		}
++		ips[sourceIP]++
+ 		return false
+ 	}
+ 
+diff --git a/internal/kernel/xray/dispatcher_test.go b/internal/kernel/xray/dispatcher_test.go
+--- a/internal/kernel/xray/dispatcher_test.go
++++ b/internal/kernel/xray/dispatcher_test.go
+@@ -1,6 +1,7 @@
+ package xray
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"sync"
+ 	"sync/atomic"
+@@ -225,7 +226,7 @@
+ 	origWriter := &closeTrackingWriter{Writer: buf.Discard, onClose: func() {}}
+ 	link := &transport.Link{Reader: origReader, Writer: origWriter}
+ 
+-	ld.trackLink(link, email, "1.1.1.1", true)
++	ld.trackLink(context.Background(), link, email, "1.1.1.1", true)
+ 
+ 	if link.Reader != origReader {
+ 		t.Fatal("trackLink must not replace link.Reader")
+@@ -244,7 +245,7 @@
+ 	}
+ 
+ 	link := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
+-	ld.trackLink(link, email, "1.1.1.1", true)
++	ld.trackLink(context.Background(), link, email, "1.1.1.1", true)
+ 
+ 	if got := ld.connCount.Load(); got != 1 {
+ 		t.Fatalf("expected connCount=1 after tracking, got %d", got)
+diff --git a/internal/kernel/xray/device_lifecycle_test.go b/internal/kernel/xray/device_lifecycle_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/kernel/xray/device_lifecycle_test.go
+@@ -0,0 +1,67 @@
++package xray
++
++import (
++	"context"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/transport"
++)
++
++func TestDeviceLimitTracksUDPAndReleasesOnContextEnd(t *testing.T) {
++	for _, tcp := range []bool{false, true} {
++		ld := newTestDispatcher()
++		email := userEmail(1)
++		ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 1}, nil)
++		ctx, cancel := context.WithCancel(context.Background())
++		if ld.checkDeviceLimit(email, "203.0.113.9", tcp) {
++			t.Fatal("first IP rejected")
++		}
++		link := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
++		ld.trackLink(ctx, link, email, "203.0.113.9", tcp)
++		if !ld.checkDeviceLimit(email, "203.0.113.1", !tcp) {
++			t.Fatal("different transport bypassed full limit")
++		}
++		cancel() // Shadowsocks bridge does not close link.Writer.
++		deadline := time.Now().Add(time.Second)
++		for ld.connCount.Load() != 0 && time.Now().Before(deadline) {
++			time.Sleep(time.Millisecond)
++		}
++		if ld.connCount.Load() != 0 {
++			t.Fatal("context end leaked tracked connection")
++		}
++		if ld.checkDeviceLimit(email, "203.0.113.1", !tcp) {
++			t.Fatal("context end did not release slot")
++		}
++		link.Writer.(*closeTrackingWriter).Close()
++		if ld.connCount.Load() != 0 {
++			t.Fatal("writer close released the same connection twice")
++		}
++		ld.delConn(email, "203.0.113.1")
++	}
++}
++
++func TestDeviceLimitConcurrentContextAndWriterClose(t *testing.T) {
++	ld := newTestDispatcher()
++	email := userEmail(1)
++	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 1}, nil)
++	for i := 0; i < 100; i++ {
++		if ld.checkDeviceLimit(email, "192.0.2.1", true) {
++			t.Fatal("slot leaked from previous iteration")
++		}
++		ctx, cancel := context.WithCancel(context.Background())
++		link := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
++		release := ld.trackLink(ctx, link, email, "192.0.2.1", true)
++		var wg sync.WaitGroup
++		wg.Add(3)
++		go func() { defer wg.Done(); cancel() }()
++		go func() { defer wg.Done(); link.Writer.(*closeTrackingWriter).Close() }()
++		go func() { defer wg.Done(); release() }()
++		wg.Wait()
++		if ld.connCount.Load() != 0 {
++			t.Fatal("connection released incorrectly")
++		}
++	}
++}

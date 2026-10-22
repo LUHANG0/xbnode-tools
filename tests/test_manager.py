@@ -196,7 +196,7 @@ class LifecycleTests(unittest.TestCase):
         xb.UNITS.mkdir()
         self.states = set()
         self.commands = []
-        self.manager = xb.Manager("owner/repo", terminal=UI("41", "42"))
+        self.manager = xb.Manager("owner/repo", release="v0.1.0", terminal=UI("41", "42"))
         self.stack.enter_context(patch.object(self.manager, "choose_profile", return_value=("synthetic", PROFILE)))
         self.stack.enter_context(patch.object(xb, "command", side_effect=self.fake_command))
         self.stack.enter_context(patch.object(xb, "wait_ready"))

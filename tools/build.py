@@ -53,7 +53,7 @@ def main():
     manifest = {"release": lock["release"], "node_version": lock["node_version"], "config_schema": lock["config_schema"],
                 "upstream_commit": lock["upstream_commit"], "upstream": lock["upstream"], "go_version": lock["go_version"],
                 "build_tags": lock["build_tags"], "maintenance_patches": patches, "manager_schema": 1,
-                "features": ["device_snapshot_refresh_v1", "local_cert_override_v1"]}
+                "features": ["device_snapshot_refresh_v1", "local_cert_override_v1", "singbox_atomic_device_limit_v1", "xray_context_release_v1"]}
     (dist / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     for name in ("xbnode.py", "install.sh", "LICENSE", "NOTICE"):
         shutil.copyfile(BASE / name, dist / name)

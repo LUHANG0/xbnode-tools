@@ -28,7 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "v0.1.0"
+VERSION = "v0.1.1"
 SCHEMA = 1
 PROTOCOLS = {
     "vless": ("VLESS", "xray", "tcp"),
@@ -58,7 +58,7 @@ def check_id(value):
 
 def check_release(value):
     if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?", value):
-        raise Error("版本号格式错误，例如 v0.1.0。")
+        raise Error("版本号格式错误，例如 v0.1.1。")
     return value
 
 

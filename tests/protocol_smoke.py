@@ -17,8 +17,10 @@ import time
 import urllib.parse
 import urllib.request
 
-USER = {"id": 901, "uuid": "43e50a02-29dd-4d52-b315-d86f3fa14ead", "device_limit": 0, "speed_limit": 0}
+USER = {"id": 901, "uuid": "43e50a02-29dd-4d52-b315-d86f3fa14ead", "device_limit": 1, "speed_limit": 0}
 definitions = {}
+hold_started = threading.Event()
+hold_release = threading.Event()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -37,6 +39,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path)
         if path.path == "/ok":
             self.reply({"synthetic_proxy_request": True})
+            return
+        if path.path == "/hold":
+            # Keep a real proxied stream active while other source IPs try
+            # admission. No customer traffic or externally reachable target.
+            self.send_response(200)
+            self.send_header("Content-Length", "32")
+            self.end_headers()
+            self.wfile.write(b"held")
+            self.wfile.flush()
+            hold_started.set()
+            hold_release.wait(60)
+            try:
+                self.wfile.write(b"x" * 28)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
         args = urllib.parse.parse_qs(path.query)
         assert args.get("token") == ["synthetic-only-token"]
@@ -84,6 +101,27 @@ def stop(process):
             process.wait()
 
 
+def proxy_request(proxy_port, api_port, path="/ok", keep_open=False, timeout=6):
+    connection = socket.create_connection(("127.0.0.1", proxy_port), timeout=timeout)
+    connection.settimeout(timeout)
+    handed_off = False
+    try:
+        connection.sendall(f"GET http://127.0.0.1:{api_port}{path} HTTP/1.1\r\nHost: 127.0.0.1:{api_port}\r\nConnection: close\r\n\r\n".encode())
+        data = b""
+        while True:
+            part = connection.recv(8192)
+            if not part:
+                break
+            data += part
+            if keep_open and b"held" in data:
+                handed_off = True
+                return connection, data
+        return None, data
+    finally:
+        if not handed_off:
+            connection.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, type=Path)
@@ -103,10 +141,11 @@ def main():
             cert, key = root / "cert.pem", root / "key.pem"
             subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1", "-days", "1", "-keyout", str(key), "-out", str(cert)], check=True, capture_output=True)
             for node_id, (protocol, kernel, transport, tls) in enumerate([
-                ("vless", "xray", "tcp", 0), ("vmess", "xray", "tcp", 0),
-                ("trojan", "xray", "tcp", 1), ("shadowsocks", "xray", "tcp+udp", 0),
+                ("shadowsocks", "xray", "tcp+udp", 0),
                 ("hysteria", "singbox", "udp", 1), ("tuic", "singbox", "udp", 1),
                 ("anytls", "singbox", "tcp", 1),
+                ("vless", "xray", "tcp", 0), ("vmess", "xray", "tcp", 0),
+                ("trojan", "xray", "tcp", 1),
             ], 901):
                 port = free_port()
                 definition = {"protocol": protocol, "server_port": port, "listen_ip": "127.0.0.1", "network": "tcp", "tls": tls,
@@ -127,7 +166,9 @@ def main():
                     config["kernel"]["custom_route"] = [{"ip_cidr": ["127.0.0.1/32"], "outbound": "direct"}]
                 path = runtime / "config.json"
                 path.write_text(json.dumps(config))
-                client = None
+                clients, held = [], None
+                hold_started.clear()
+                hold_release.clear()
                 with (runtime / "server.log").open("w+") as log, (runtime / "client.log").open("w+") as client_log:
                     process = subprocess.Popen([str(args.binary), "-c", str(path)], stdout=log, stderr=log)
                     try:
@@ -141,7 +182,6 @@ def main():
                         assert listening(port, transport), protocol + " did not listen"
                         result = {"protocol": "hysteria2" if protocol == "hysteria" else protocol, "kernel": kernel, "listener": True, "local_cert_override": bool(tls)}
                         if args.client:
-                            http_port = free_port()
                             outbound = {"type": "hysteria2" if protocol == "hysteria" else protocol, "tag": "proxy", "server": "127.0.0.1", "server_port": port}
                             if protocol in ("vless", "vmess", "tuic"):
                                 outbound["uuid"] = USER["uuid"]
@@ -156,31 +196,58 @@ def main():
                                 outbound["tls"] = {"enabled": True, "server_name": "localhost", "certificate_path": str(cert)}
                                 if protocol in ("hysteria", "tuic"):
                                     outbound["tls"]["alpn"] = ["h3"]
-                            client_cfg = {"log": {"level": "warn"}, "inbounds": [{"type": "http", "listen": "127.0.0.1", "listen_port": http_port}], "outbounds": [outbound], "route": {"final": "proxy"}}
-                            client_path = runtime / "client.json"
-                            client_path.write_text(json.dumps(client_cfg))
-                            client = subprocess.Popen([str(args.client), "run", "-c", str(client_path)], stdout=client_log, stderr=client_log)
-                            deadline = time.monotonic() + 15
-                            while time.monotonic() < deadline and not listening(http_port, "tcp") and client.poll() is None:
-                                time.sleep(0.2)
-                            assert client.poll() is None, (runtime / "client.log").read_text()
-                            # urllib bypasses proxies for loopback, so send an
-                            # absolute-form HTTP request to the proxy manually.
-                            with socket.create_connection(("127.0.0.1", http_port), timeout=8) as connection:
-                                connection.settimeout(15)
-                                connection.sendall(f"GET http://127.0.0.1:{api_port}/ok HTTP/1.1\r\nHost: 127.0.0.1:{api_port}\r\nConnection: close\r\n\r\n".encode())
-                                data = b""
-                                while True:
-                                    part = connection.recv(8192)
-                                    if not part:
-                                        break
-                                    data += part
-                            assert b"200 OK" in data and b"synthetic_proxy_request" in data, protocol + " request failed: " + (runtime / "client.log").read_text()[-1500:] + (runtime / "server.log").read_text()[-1500:]
+                            def start_client(source_ip):
+                                proxy_port = free_port()
+                                bound = dict(outbound, inet4_bind_address=source_ip)
+                                client_cfg = {"log": {"level": "warn"}, "inbounds": [{"type": "http", "listen": "127.0.0.1", "listen_port": proxy_port}], "outbounds": [bound], "route": {"final": "proxy"}}
+                                client_path = runtime / ("client-" + source_ip + ".json")
+                                client_path.write_text(json.dumps(client_cfg))
+                                client = subprocess.Popen([str(args.client), "run", "-c", str(client_path)], stdout=client_log, stderr=client_log)
+                                clients.append(client)
+                                deadline = time.monotonic() + 15
+                                while time.monotonic() < deadline and not listening(proxy_port, "tcp") and client.poll() is None:
+                                    time.sleep(0.1)
+                                assert client.poll() is None and listening(proxy_port, "tcp"), (runtime / "client.log").read_text()
+                                return client, proxy_port
+
+                            first, first_port = start_client("127.0.0.9")
+                            held, data = proxy_request(first_port, api_port, "/hold", keep_open=True)
+                            assert b"200 OK" in data and hold_started.wait(2), protocol + " initial IP failed"
+                            _, data = proxy_request(first_port, api_port)
+                            assert b"200 OK" in data and b"synthetic_proxy_request" in data, protocol + " same-IP request failed"
                             result["synthetic_proxy_request"] = True
+                            second, second_port = start_client("127.0.0.2")
+                            try:
+                                _, data = proxy_request(second_port, api_port, timeout=3)
+                            except (OSError, TimeoutError):
+                                data = b""
+                            assert b"synthetic_proxy_request" not in data, protocol + " exceeded a one-IP device limit"
+                            result["new_source_ip_rejected"] = True
+                            result["same_source_ip_allowed"] = True
+                            hold_release.set()
+                            held.close()
+                            held = None
+                            stop(first)
+                            deadline = time.monotonic() + 25
+                            data = b""
+                            while time.monotonic() < deadline:
+                                try:
+                                    _, data = proxy_request(second_port, api_port, timeout=3)
+                                    if b"synthetic_proxy_request" in data:
+                                        break
+                                except (OSError, TimeoutError):
+                                    pass
+                                time.sleep(0.3)
+                            assert b"200 OK" in data and b"synthetic_proxy_request" in data, protocol + " slot not released: " + (runtime / "client.log").read_text()[-1500:] + (runtime / "server.log").read_text()[-1500:]
+                            result["slot_reused_after_disconnect"] = True
                         results.append(result)
                         print(json.dumps(result), flush=True)
                     finally:
-                        stop(client)
+                        hold_release.set()
+                        if held:
+                            held.close()
+                        for client in clients:
+                            stop(client)
                         stop(process)
     finally:
         panel.shutdown()

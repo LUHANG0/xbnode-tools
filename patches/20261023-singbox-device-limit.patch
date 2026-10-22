@@ -1,0 +1,510 @@
+diff --git a/internal/kernel/singbox/conntracker.go b/internal/kernel/singbox/conntracker.go
+--- a/internal/kernel/singbox/conntracker.go
++++ b/internal/kernel/singbox/conntracker.go
+@@ -4,7 +4,6 @@
+ 	"context"
+ 	"io"
+ 	"net"
+-	"sort"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+@@ -217,36 +216,28 @@
+ 	us := t.users[uid]
+ 	t.usersMu.RUnlock()
+ 
+-	// Device limit gate-keeping
++	// Check and reserve under the same user lock for TCP and UDP alike.
++	limit := 0
+ 	if dlf := t.deviceLimitFunc.Load(); dlf != nil {
+-		if limit, hasLimit := (*dlf)(uuid); hasLimit {
+-			if t.checkDeviceGate(us, uid, sourceIP, limit) {
+-				nlog.Core().Info("singbox: device limit gate-keep, rejecting connection",
+-					"user", uuid, "ip", sourceIP, "limit", limit)
+-				conn.Close()
+-				return conn
+-			}
+-		}
+-	}
+-
+-	// Register connection
+-	if us != nil {
+-		us.addConn(sourceIP)
++		if value, hasLimit := (*dlf)(uuid); hasLimit {
++			limit = value
++		}
++	}
++	if !t.reserveConn(us, uid, sourceIP, limit) {
++		nlog.Core().Info("singbox: device limit gate-keep, rejecting connection",
++			"user_id", uid, "limit", limit)
++		conn.Close()
++		return conn
+ 	}
+ 
+ 	connID := t.nextID()
+-
+-	// Store conn reference for force-close support
+-	t.usersMu.Lock()
+-	t.connMap[connID] = conn
+-	t.usersMu.Unlock()
+ 
+ 	var lim *rate.Limiter
+ 	if slf := t.speedLimitFunc.Load(); slf != nil {
+ 		lim = (*slf)(uuid)
+ 	}
+ 
+-	return &trackedConn{
++	wrapped := &trackedConn{
+ 		Conn:     conn,
+ 		tracker:  t,
+ 		us:       us,
+@@ -256,6 +247,10 @@
+ 		limiter:  lim,
+ 		ctx:      ctx,
+ 	}
++	t.usersMu.Lock()
++	t.connMap[connID] = wrapped
++	t.usersMu.Unlock()
++	return wrapped
+ }
+ 
+ // RoutedPacketConnection wraps UDP with per-user counting (UDP not in connMap).
+@@ -275,20 +270,17 @@
+ 	us := t.users[uid]
+ 	t.usersMu.RUnlock()
+ 
+-	// Device limit gate-keeping
++	limit := 0
+ 	if dlf := t.deviceLimitFunc.Load(); dlf != nil {
+-		if limit, hasLimit := (*dlf)(uuid); hasLimit {
+-			if t.checkDeviceGate(us, uid, sourceIP, limit) {
+-				nlog.Core().Info("singbox: device limit gate-keep, rejecting UDP connection",
+-					"user", uuid, "ip", sourceIP, "limit", limit)
+-				conn.Close()
+-				return conn
+-			}
+-		}
+-	}
+-
+-	if us != nil {
+-		us.addConn(sourceIP)
++		if value, hasLimit := (*dlf)(uuid); hasLimit {
++			limit = value
++		}
++	}
++	if !t.reserveConn(us, uid, sourceIP, limit) {
++		nlog.Core().Info("singbox: device limit gate-keep, rejecting UDP connection",
++			"user_id", uid, "limit", limit)
++		conn.Close()
++		return conn
+ 	}
+ 
+ 	connID := t.nextID()
+@@ -310,86 +302,42 @@
+ 	}
+ }
+ 
+-// checkDeviceGate rejects connections exceeding device limit.
+-// Strategy: merge local + global state when fresh; local-only when stale.
+-func (t *ConnTracker) checkDeviceGate(us *userStats, userID int, sourceIP string, limit int) bool {
+-	if us == nil || limit <= 0 {
+-		return false
+-	}
+-
+-	us.mu.RLock()
+-	localIPs := make(map[string]bool, len(us.ips))
+-	for ip := range us.ips {
+-		localIPs[ip] = true
+-	}
+-	localCount := len(us.ips)
+-	us.mu.RUnlock()
+-
+-	// Already known locally
+-	if localIPs[sourceIP] {
+-		return false
+-	}
+-
+-	// Check global state freshness
+-	t.globalMu.RLock()
+-	globalStale := time.Since(t.globalLastUpdate) > 60*time.Second
+-	globalIPs := t.globalDevices[userID]
+-	t.globalMu.RUnlock()
+-
+-	// Stale or missing global state → local-only check
+-	if globalStale || globalIPs == nil {
+-		if localCount < limit {
++// reserveConn checks distinct source-IP limits and registers the connection in
++// one critical section. A rejected IP must never acquire a tracking reference.
++// Fresh panel state is an additional best-effort restriction; it cannot grant
++// an exemption from the local ceiling or provide cross-node atomic admission.
++func (t *ConnTracker) reserveConn(us *userStats, userID int, sourceIP string, limit int) bool {
++	if us == nil {
++		return true // Preserve handling of connections without per-user statistics.
++	}
++	us.mu.Lock()
++	defer us.mu.Unlock()
++
++	if limit > 0 && us.ips[sourceIP] == 0 {
++		// Existing local IPs can open more connections. A new local IP cannot
++		// displace one, including when it sorts earlier or is known globally.
++		if len(us.ips) >= limit {
+ 			return false
+ 		}
+-		ipList := make([]string, 0, localCount+1)
+-		for ip := range localIPs {
+-			ipList = append(ipList, ip)
+-		}
+-		ipList = append(ipList, sourceIP)
+-		sort.Strings(ipList)
+-		for i := 0; i < limit && i < len(ipList); i++ {
+-			if ipList[i] == sourceIP {
++		t.globalMu.RLock()
++		globalIPs := t.globalDevices[userID]
++		fresh := time.Since(t.globalLastUpdate) <= 60*time.Second
++		if fresh && globalIPs != nil && !globalIPs[sourceIP] {
++			count := len(us.ips)
++			for ip := range globalIPs {
++				if us.ips[ip] == 0 {
++					count++
++				}
++			}
++			if count >= limit {
++				t.globalMu.RUnlock()
+ 				return false
+ 			}
+ 		}
+-		nlog.Core().Debug("device limit: local over limit, rejecting",
+-			"userID", userID, "ip", sourceIP, "localIPs", localCount, "limit", limit)
+-		return true
+-	}
+-
+-	// Known globally (from other node)
+-	if globalIPs[sourceIP] {
+-		return false
+-	}
+-
+-	// Merge local + global
+-	allIPs := make(map[string]bool)
+-	for ip := range localIPs {
+-		allIPs[ip] = true
+-	}
+-	for ip := range globalIPs {
+-		allIPs[ip] = true
+-	}
+-
+-	if len(allIPs) < limit {
+-		return false
+-	}
+-
+-	// Over limit → lexicographic selection
+-	ipList := make([]string, 0, len(allIPs)+1)
+-	for ip := range allIPs {
+-		ipList = append(ipList, ip)
+-	}
+-	ipList = append(ipList, sourceIP)
+-	sort.Strings(ipList)
+-
+-	for i := 0; i < limit && i < len(ipList); i++ {
+-		if ipList[i] == sourceIP {
+-			return false
+-		}
+-	}
+-	nlog.Core().Debug("device limit: total over limit, rejecting",
+-		"userID", userID, "ip", sourceIP, "totalIPs", len(allIPs), "limit", limit)
++		t.globalMu.RUnlock()
++	}
++	us.connCount++
++	us.ips[sourceIP]++
+ 	return true
+ }
+ 
+diff --git a/internal/kernel/singbox/singbox_test.go b/internal/kernel/singbox/singbox_test.go
+--- a/internal/kernel/singbox/singbox_test.go
++++ b/internal/kernel/singbox/singbox_test.go
+@@ -142,26 +142,6 @@
+ 	}
+ }
+ 
+-func TestConnTrackerCheckDeviceGateMergesFreshGlobalDevices(t *testing.T) {
+-	tracker := NewConnTracker(0)
+-	tracker.SetUserMap(map[string]int{"uuid-1": 1})
+-	us := tracker.users[1]
+-	us.addConn("1.1.1.1")
+-	tracker.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}})
+-
+-	if tracker.checkDeviceGate(us, 1, "2.2.2.2", 2) {
+-		t.Fatal("expected lexicographically earlier candidate to remain allowed")
+-	}
+-	if !tracker.checkDeviceGate(us, 1, "99.99.99.99", 2) {
+-		t.Fatal("expected merged local+global device state to reject lexicographically later third device")
+-	}
+-	if tracker.checkDeviceGate(us, 1, "1.1.1.1", 2) {
+-		t.Fatal("existing local IP should still be allowed")
+-	}
+-	if tracker.checkDeviceGate(us, 1, "9.9.9.9", 2) {
+-		t.Fatal("existing global IP should still be allowed")
+-	}
+-}
+ 
+ func TestConnTrackerCloseByIDClosesTrackedConnection(t *testing.T) {
+ 	tracker := NewConnTracker(0)
+diff --git a/internal/kernel/singbox/device_limit_test.go b/internal/kernel/singbox/device_limit_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/kernel/singbox/device_limit_test.go
+@@ -0,0 +1,255 @@
++package singbox
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing/common/buf"
++	singM "github.com/sagernet/sing/common/metadata"
++)
++
++type limitPacketConn struct{ testConn }
++
++func (c *limitPacketConn) ReadPacket(*buf.Buffer) (singM.Socksaddr, error) {
++	return singM.Socksaddr{}, io.EOF
++}
++func (c *limitPacketConn) WritePacket(*buf.Buffer, singM.Socksaddr) error { return nil }
++
++func limitTracker(limit int) *ConnTracker {
++	t := NewConnTracker(0)
++	t.SetUserMap(map[string]int{"uuid-1": 1, "uuid-2": 2})
++	t.SetDeviceLimitFunc(func(string) (int, bool) { return limit, true })
++	return t
++}
++
++// A false result means the original connection was closed and never tracked.
++func routeLimited(t *ConnTracker, udp bool, uuid, ip string) (io.Closer, bool) {
++	ctx := testInboundContext(uuid, ip)
++	if udp {
++		base := &limitPacketConn{}
++		wrapped := t.RoutedPacketConnection(context.Background(), base, ctx, nil, nil)
++		return wrapped, wrapped != base && !base.closed
++	}
++	base := &testConn{}
++	wrapped := t.RoutedConnection(context.Background(), base, ctx, nil, nil)
++	return wrapped, wrapped != base && !base.closed
++}
++
++func TestDeviceLimitRejectsLowerOrderIP(t *testing.T) {
++	for _, udp := range []bool{false, true} {
++		t.Run(fmt.Sprint("udp=", udp), func(t *testing.T) {
++			tracker := limitTracker(1)
++			first, ok := routeLimited(tracker, udp, "uuid-1", "9.9.9.9")
++			if !ok {
++				t.Fatal("first IP rejected")
++			}
++			defer first.Close()
++			second, ok := routeLimited(tracker, udp, "uuid-1", "1.1.1.1")
++			defer second.Close()
++			if ok {
++				t.Fatal("lower-sorted new IP bypassed a full device limit")
++			}
++			_, alive, count := tracker.GetUserTraffic()
++			if len(alive[1]) != 1 || count != 1 {
++				t.Fatalf("rejected IP was tracked: %v / %d", alive, count)
++			}
++		})
++	}
++}
++
++func TestDeviceLimitSameIPReferencesAndRelease(t *testing.T) {
++	for _, udp := range []bool{false, true} {
++		t.Run(fmt.Sprint("udp=", udp), func(t *testing.T) {
++			tracker := limitTracker(1)
++			first, ok := routeLimited(tracker, udp, "uuid-1", "9.9.9.9")
++			if !ok {
++				t.Fatal("first rejected")
++			}
++			second, ok := routeLimited(tracker, !udp, "uuid-1", "9.9.9.9")
++			if !ok {
++				t.Fatal("same IP rejected")
++			}
++			first.Close()
++			first.Close() // repeated close must not release the remaining ref
++			blocked, ok := routeLimited(tracker, udp, "uuid-1", "1.1.1.1")
++			blocked.Close()
++			if ok {
++				t.Fatal("IP released before its final connection closed")
++			}
++			second.Close()
++			third, ok := routeLimited(tracker, udp, "uuid-1", "1.1.1.1")
++			if !ok {
++				t.Fatal("slot not reusable after all prior connections closed")
++			}
++			third.Close()
++			_, alive, count := tracker.GetUserTraffic()
++			if len(alive) != 0 || count != 0 {
++				t.Fatalf("tracking leaked: %v / %d", alive, count)
++			}
++		})
++	}
++}
++
++func TestDeviceLimitConcurrentMixedTransports(t *testing.T) {
++	const attempts, limit = 96, 3
++	tracker := limitTracker(limit)
++	start := make(chan struct{})
++	accepted := make(chan io.Closer, attempts)
++	var wg sync.WaitGroup
++	for i := 0; i < attempts; i++ {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			<-start
++			conn, ok := routeLimited(tracker, i%2 == 0, "uuid-1", fmt.Sprintf("192.0.2.%d", i+1))
++			if ok {
++				accepted <- conn
++			} else {
++				conn.Close()
++			}
++		}(i)
++	}
++	close(start)
++	wg.Wait()
++	close(accepted)
++	_, alive, count := tracker.GetUserTraffic()
++	if len(alive[1]) != limit || count != limit {
++		t.Errorf("concurrent limit exceeded: %v / %d", alive, count)
++	}
++	n := 0
++	for conn := range accepted {
++		n++
++		conn.Close()
++	}
++	if n != limit {
++		t.Fatalf("accepted %d, want %d", n, limit)
++	}
++	if tracker.ActiveCount() != 0 {
++		t.Fatal("connections leaked after close")
++	}
++}
++
++func TestDeviceLimitZeroAndIndependentUsers(t *testing.T) {
++	for _, limit := range []int{0, 1} {
++		tracker := limitTracker(limit)
++		for _, uuid := range []string{"uuid-1", "uuid-2"} {
++			conn, ok := routeLimited(tracker, false, uuid, "9.9.9.9")
++			if !ok {
++				t.Fatal("independent user's first IP rejected")
++			}
++			defer conn.Close()
++		}
++		if limit == 0 {
++			conn, ok := routeLimited(tracker, true, "uuid-1", "1.1.1.1")
++			defer conn.Close()
++			if !ok {
++				t.Fatal("unlimited user was limited")
++			}
++		}
++	}
++}
++
++func TestDeviceLimitGlobalSnapshotAndLocalCeiling(t *testing.T) {
++	tracker := limitTracker(2)
++	first, _ := routeLimited(tracker, false, "uuid-1", "9.9.9.9")
++	defer first.Close()
++	tracker.UpdateGlobalDevices(map[int][]string{1: {"8.8.8.8"}})
++	blocked, ok := routeLimited(tracker, true, "uuid-1", "1.1.1.1")
++	blocked.Close()
++	if ok {
++		t.Fatal("new IP bypassed full merged state")
++	}
++	known, ok := routeLimited(tracker, true, "uuid-1", "8.8.8.8")
++	if !ok {
++		t.Fatal("known global IP should fit the local ceiling")
++	}
++	defer known.Close()
++	tracker.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1"}})
++	blocked, ok = routeLimited(tracker, false, "uuid-1", "1.1.1.1")
++	blocked.Close()
++	if ok {
++		t.Fatal("global-known IP bypassed full local ceiling")
++	}
++	known.Close()
++	tracker.globalMu.Lock()
++	tracker.globalLastUpdate = time.Now().Add(-61 * time.Second)
++	tracker.globalMu.Unlock()
++	conn, ok := routeLimited(tracker, false, "uuid-1", "1.1.1.1")
++	defer conn.Close()
++	if !ok {
++		t.Fatal("stale global state blocked an available local slot")
++	}
++}
++
++func TestDeviceLimitGlobalUpdatesConcurrentWithAdmission(t *testing.T) {
++	tracker := limitTracker(2)
++	var wg sync.WaitGroup
++	wg.Add(2)
++	go func() {
++		defer wg.Done()
++		for i := 0; i < 200; i++ {
++			tracker.UpdateGlobalDevices(map[int][]string{1: {"203.0.113.1"}})
++			tracker.ClearGlobalDevices()
++		}
++	}()
++	go func() {
++		defer wg.Done()
++		for i := 0; i < 200; i++ {
++			conn, _ := routeLimited(tracker, i%2 == 0, "uuid-1", "192.0.2.1")
++			conn.Close()
++		}
++	}()
++	wg.Wait()
++	if tracker.ActiveCount() != 0 {
++		t.Fatal("connection count leaked")
++	}
++}
++
++func TestDeviceLimitForcedCloseReleasesSlot(t *testing.T) {
++	tracker := limitTracker(1)
++	conn, _ := routeLimited(tracker, false, "uuid-1", "9.9.9.9")
++	tracked := conn.(*trackedConn)
++	if !tracker.CloseByID(tracked.connID) {
++		t.Fatal("forced close failed")
++	}
++	if tracker.ActiveCount() != 0 {
++		t.Fatal("forced close did not release slot")
++	}
++	next, ok := routeLimited(tracker, false, "uuid-1", "1.1.1.1")
++	defer next.Close()
++	if !ok {
++		t.Fatal("slot unavailable after forced close")
++	}
++	conn.Close()
++	if tracker.ActiveCount() != 1 {
++		t.Fatal("duplicate close released another connection")
++	}
++}
++
++func TestDeviceLimitGlobalUnionDeduplicatesAndClearReleases(t *testing.T) {
++	tracker := limitTracker(2)
++	first, _ := routeLimited(tracker, false, "uuid-1", "9.9.9.9")
++	defer first.Close()
++	tracker.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9", "9.9.9.9"}})
++	second, ok := routeLimited(tracker, true, "uuid-1", "1.1.1.1")
++	if !ok {
++		t.Fatal("same IP in both local and global was counted twice")
++	}
++	second.Close()
++	tracker.UpdateGlobalDevices(map[int][]string{1: {"8.8.8.8"}})
++	blocked, ok := routeLimited(tracker, true, "uuid-1", "1.1.1.1")
++	blocked.Close()
++	if ok {
++		t.Fatal("full global union allowed a new IP")
++	}
++	tracker.ClearGlobalDevices()
++	second, ok = routeLimited(tracker, true, "uuid-1", "1.1.1.1")
++	defer second.Close()
++	if !ok {
++		t.Fatal("cleared global state still blocked available local slot")
++	}
++}
