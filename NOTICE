@@ -1,0 +1,9 @@
+Xboard-Node upstream: https://github.com/cedar2025/Xboard-Node
+Pinned source commit: 0a29338e1f102a462363ce3527417029f89bab28
+Upstream README declares MPL-2.0. The upstream work and changes to it retain
+that license. See LICENSE and patches/ for the modified source. Each executable
+release includes patched-source.tar.gz with the exact patched application source.
+Dependency notices and licenses remain with the corresponding Go modules.
+
+The independent installer and its tests are also provided under MPL-2.0.
+No production credentials, customer records, or certificates are included.

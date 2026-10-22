@@ -1,0 +1,13 @@
+{
+  "release": "v0.1.0",
+  "node_version": "v1.13-maint-20261023",
+  "upstream": "https://github.com/cedar2025/Xboard-Node.git",
+  "upstream_commit": "0a29338e1f102a462363ce3527417029f89bab28",
+  "go_version": "1.26.10",
+  "config_schema": 1,
+  "build_tags": "with_quic with_utls with_wireguard with_acme with_clash_api",
+  "patches": [
+    "patches/20261022-device-reporting.patch",
+    "patches/20261023-local-cert.patch"
+  ]
+}

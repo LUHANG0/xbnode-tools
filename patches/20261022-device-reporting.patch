@@ -1,0 +1,311 @@
+diff --git a/internal/kernel/xray/config.go b/internal/kernel/xray/config.go
+index 1603f7b..e14230f 100644
+--- a/internal/kernel/xray/config.go
++++ b/internal/kernel/xray/config.go
+@@ -48,7 +48,7 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
+ 		"log": M{
+ 			"loglevel": xrayLogLevel(kcfg.LogLevel),
+ 			"error":    "",
+-			"access":   "",
++			"access":   "none",
+ 		},
+ 		"stats": M{},
+ 		"policy": M{
+diff --git a/internal/kernel/xray/config_test.go b/internal/kernel/xray/config_test.go
+index cfab5e7..fb4e475 100644
+--- a/internal/kernel/xray/config_test.go
++++ b/internal/kernel/xray/config_test.go
+@@ -17,6 +17,13 @@ var testKernelCfg = config.KernelConfig{
+ 	LogLevel: "warn",
+ }
+ 
++func TestGeneratedConfigDisablesClientAccessLog(t *testing.T) {
++	cfg := buildConfig(testKernelCfg, &model.NodeSpec{Protocol: "vless", ServerPort: 30000, Network: "tcp"}, nil, kernel.TLSCert{})
++	if cfg["log"].(M)["access"] != "none" {
++		t.Fatal("generated config must not log client IPs")
++	}
++}
++
+ var testUsersPanel = []panel.User{
+ 	{ID: 1, UUID: "279d4f89-3a2c-488d-a67c-2d39a72acdde"},
+ 	{ID: 5, UUID: "4d5965c8-a60c-452a-a943-af83ec0bb0db"},
+diff --git a/internal/kernel/xray/dispatcher.go b/internal/kernel/xray/dispatcher.go
+index 18ebe32..c702d56 100644
+--- a/internal/kernel/xray/dispatcher.go
++++ b/internal/kernel/xray/dispatcher.go
+@@ -4,7 +4,6 @@ import (
+ 	"context"
+ 	"errors"
+ 	"reflect"
+-	"sort"
+ 	"sync"
+ 	"sync/atomic"
+ 	_ "unsafe"
+@@ -224,7 +223,9 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
+ 
+ 	aliveIPs = make(map[int]map[string]bool)
+ 
+-	// Collect IPs from limited users (under RLock snapshot).
++	// Copy limited IPs while holding the lock; connection admission/removal
++	// mutates these maps concurrently.
++	d.mu.RLock()
+ 	for email, ipsMap := range limitedIPs {
+ 		uid := emailToUID[email]
+ 		if uid == 0 {
+@@ -238,6 +239,7 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
+ 			aliveIPs[uid] = ipSet
+ 		}
+ 	}
++	d.mu.RUnlock()
+ 
+ 	// Collect IPs from unlimited users (lock-free).
+ 	d.unlimitedIPs.Range(func(key, value interface{}) bool {
+@@ -287,39 +289,12 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
+ 		return false
+ 	}
+ 
+-	// Slow path: user has device limit — need deterministic ordering.
+-	d.mu.RLock()
+-	ips := d.limitedIPs[email]
+-	if ips != nil && ips[sourceIP] > 0 {
+-		d.mu.RUnlock()
+-		if isTCP {
+-			d.mu.Lock()
+-			d.limitedIPs[email][sourceIP]++
+-			d.mu.Unlock()
+-		}
+-		return false
+-	}
+-
+-	if ips != nil && len(ips) < limit {
+-		d.mu.RUnlock()
+-		if isTCP {
+-			d.mu.Lock()
+-			if d.limitedIPs[email] == nil {
+-				d.limitedIPs[email] = make(map[string]int)
+-			}
+-			d.limitedIPs[email][sourceIP]++
+-			d.mu.Unlock()
+-		}
+-		return false
+-	}
+-	d.mu.RUnlock()
+-
+-	// Over limit — need write lock for deterministic check.
++	// Reserve a new source IP atomically. A new lexicographically smaller IP
++	// must not bypass the limit while the existing connections remain active.
+ 	d.mu.Lock()
+ 	defer d.mu.Unlock()
+ 
+-	// Re-check under write lock.
+-	ips = d.limitedIPs[email]
++	ips := d.limitedIPs[email]
+ 	if ips == nil {
+ 		ips = make(map[string]int)
+ 		d.limitedIPs[email] = ips
+@@ -339,22 +314,6 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
+ 		return false
+ 	}
+ 
+-	// Over limit — deterministic: allow lowest IPs lexicographically.
+-	ipList := make([]string, 0, len(ips)+1)
+-	for ip := range ips {
+-		ipList = append(ipList, ip)
+-	}
+-	ipList = append(ipList, sourceIP)
+-	sort.Strings(ipList)
+-
+-	for i := 0; i < limit && i < len(ipList); i++ {
+-		if ipList[i] == sourceIP {
+-			if isTCP {
+-				ips[sourceIP]++
+-			}
+-			return false
+-		}
+-	}
+ 	return true
+ }
+ 
+diff --git a/internal/kernel/xray/dispatcher_test.go b/internal/kernel/xray/dispatcher_test.go
+index 1b39fe8..d32083e 100644
+--- a/internal/kernel/xray/dispatcher_test.go
++++ b/internal/kernel/xray/dispatcher_test.go
+@@ -1,6 +1,8 @@
+ package xray
+ 
+ import (
++	"fmt"
++	"sync"
+ 	"sync/atomic"
+ 	"testing"
+ 
+@@ -9,6 +11,35 @@ import (
+ 	"github.com/xtls/xray-core/transport"
+ )
+ 
++func TestDeviceLimitRejectsLowerIPAndConcurrentNewIPs(t *testing.T) {
++	ld := newTestDispatcher()
++	email := userEmail(1)
++	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 1}, nil)
++	if ld.checkDeviceLimit(email, "203.0.113.20", true) {
++		t.Fatal("first source rejected")
++	}
++	if !ld.checkDeviceLimit(email, "203.0.113.10", true) {
++		t.Fatal("smaller source bypassed occupied device limit")
++	}
++	ld.delConn(email, "203.0.113.20")
++	var accepted atomic.Int64
++	var wg sync.WaitGroup
++	for i := 1; i <= 32; i++ {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			if !ld.checkDeviceLimit(email, fmt.Sprintf("203.0.113.%d", i), true) {
++				accepted.Add(1)
++			}
++			ld.GetConnectionState()
++		}(i)
++	}
++	wg.Wait()
++	if got := accepted.Load(); got != 1 {
++		t.Fatalf("concurrent unique sources admitted: %d, want 1", got)
++	}
++}
++
+ func newTestDispatcher() *LimitDispatcher {
+ 	return &LimitDispatcher{
+ 		limitedIPs: make(map[string]map[string]int),
+@@ -185,7 +216,6 @@ func TestLimitDispatcher_UnlimitedUserFastPath(t *testing.T) {
+ 	}
+ }
+ 
+-
+ func TestLimitDispatcher_TrackLinkPreservesReader(t *testing.T) {
+ 	ld := newTestDispatcher()
+ 	email := userEmail(1)
+diff --git a/internal/panel/client.go b/internal/panel/client.go
+index a725afc..82235ef 100644
+--- a/internal/panel/client.go
++++ b/internal/panel/client.go
+@@ -444,7 +444,12 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
+ 	resp, err := c.httpClient.Do(req)
+ 	if err != nil {
+ 		c.apiFailure.Add(1)
+-		return nil, err
++		// net/http URL errors include the complete GET query, including token.
++		// Keep the transport cause without copying credentials into service logs.
++		if urlErr, ok := err.(*url.Error); ok {
++			return nil, fmt.Errorf("panel request %s %s: %w", method, path, urlErr.Err)
++		}
++		return nil, fmt.Errorf("panel request %s %s failed", method, path)
+ 	}
+ 
+ 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+diff --git a/internal/panel/client_test.go b/internal/panel/client_test.go
+index 1d0c74a..4e825e5 100644
+--- a/internal/panel/client_test.go
++++ b/internal/panel/client_test.go
+@@ -4,11 +4,25 @@ import (
+ 	"encoding/json"
+ 	"net/http"
+ 	"net/http/httptest"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/cedar2025/xboard-node/internal/config"
+ )
+ 
++func TestTransportErrorDoesNotExposeToken(t *testing.T) {
++	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
++	ts.Close()
++	client := NewClient(config.PanelConfig{URL: ts.URL, Token: "synthetic-token-not-for-logs", NodeID: 901})
++	_, err := client.GetConfig()
++	if err == nil {
++		t.Fatal("expected connection error")
++	}
++	if strings.Contains(err.Error(), "synthetic-token-not-for-logs") || strings.Contains(err.Error(), "token=") {
++		t.Fatalf("transport error exposed authentication query")
++	}
++}
++
+ func newTestServer(handler http.HandlerFunc) (*httptest.Server, *Client) {
+ 	ts := httptest.NewServer(handler)
+ 	client := NewClient(config.PanelConfig{
+diff --git a/internal/service/service.go b/internal/service/service.go
+index 890940d..dea6112 100644
+--- a/internal/service/service.go
++++ b/internal/service/service.go
+@@ -976,7 +976,7 @@ func (s *Service) pushReportAsync() {
+ 	}
+ 
+ 	traffic := s.tracker.FlushTraffic()
+-	aliveIPs := s.tracker.FlushAliveIPs()
++	aliveIPs := s.tracker.SnapshotAliveIPs()
+ 	online := s.tracker.CurrentOnline()
+ 	status := monitor.Collect()
+ 	metrics := s.buildMetrics(status)
+@@ -1006,7 +1006,7 @@ func (s *Service) pushReportSync() {
+ 		return
+ 	}
+ 	traffic := s.tracker.FlushTraffic()
+-	aliveIPs := s.tracker.FlushAliveIPs()
++	aliveIPs := s.tracker.SnapshotAliveIPs()
+ 	online := s.tracker.CurrentOnline()
+ 	status := monitor.Collect()
+ 	metrics := s.buildMetrics(status)
+diff --git a/internal/tracker/tracker.go b/internal/tracker/tracker.go
+index ec64435..07acb8a 100644
+--- a/internal/tracker/tracker.go
++++ b/internal/tracker/tracker.go
+@@ -159,6 +159,22 @@ func (t *Tracker) HasTraffic() bool {
+ 	return len(t.pendingTraffic) > 0
+ }
+ 
++// SnapshotAliveIPs returns an independent snapshot for periodic REST reports.
++// Unlike change-only WS batches, REST reports must refresh the panel's device
++// TTL even when a long-lived connection keeps the same source IP.
++func (t *Tracker) SnapshotAliveIPs() map[int][]string {
++	s := t.live.Load()
++	result := make(map[int][]string, len(s.aliveIPs))
++	for uid, ips := range s.aliveIPs {
++		list := make([]string, 0, len(ips))
++		for ip := range ips {
++			list = append(list, ip)
++		}
++		result[uid] = list
++	}
++	return result
++}
++
+ // FlushAliveIPs returns per-user alive IPs.
+ // Reuses internal buffer. Returns nil if unchanged.
+ func (t *Tracker) FlushAliveIPs() map[int][]string {
+diff --git a/internal/tracker/tracker_test.go b/internal/tracker/tracker_test.go
+index 8035573..a904024 100644
+--- a/internal/tracker/tracker_test.go
++++ b/internal/tracker/tracker_test.go
+@@ -4,6 +4,24 @@ import (
+ 	"testing"
+ )
+ 
++func TestSnapshotAliveIPsRefreshesUnchangedRESTDevices(t *testing.T) {
++	tr := New()
++	tr.Process(nil, map[int]map[string]bool{1: {"203.0.113.10": true}}, 1)
++	_ = tr.FlushAliveIPs() // A WS batch must not consume the REST heartbeat.
++	for i := 0; i < 3; i++ {
++		snapshot := tr.SnapshotAliveIPs()
++		if len(snapshot[1]) != 1 || snapshot[1][0] != "203.0.113.10" {
++			t.Fatalf("REST refresh %d lost active device: %#v", i, snapshot)
++		}
++		snapshot[1][0] = "mutated"
++		delete(snapshot, 1)
++	}
++	tr.Process(nil, nil, 0)
++	if got := tr.SnapshotAliveIPs(); len(got) != 0 {
++		t.Fatalf("disconnected device remained in snapshot: %#v", got)
++	}
++}
++
+ func TestProcess_InitialTraffic(t *testing.T) {
+ 	tr := New()
+ 	cumTraffic := map[int][2]int64{

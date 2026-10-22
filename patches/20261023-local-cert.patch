@@ -1,0 +1,78 @@
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -145,6 +145,10 @@
+ }
+ 
+ type CertConfig struct {
++	// PreferLocal keeps an explicitly managed local certificate policy.
++	// False preserves the upstream panel-first behavior.
++	PreferLocal bool `yaml:"prefer_local"`
++	ACMEAgreed bool `yaml:"acme_agreed"`
+ 	AutoTLS  bool   `yaml:"auto_tls"`
+ 	Domain   string `yaml:"domain"`
+ 	Email    string `yaml:"email"`
+--- a/internal/service/service.go
++++ b/internal/service/service.go
+@@ -329,6 +329,11 @@
+ 	if nc.KernelLogLevel != "" && nc.KernelLogLevel != s.cfg.Kernel.LogLevel {
+ 		nlog.Core().Info("cert: kernel log level override", "old", s.cfg.Kernel.LogLevel, "new", nc.KernelLogLevel)
+ 		s.cfg.Kernel.LogLevel = nc.KernelLogLevel
++	}
++
++	// Installer-managed cert files/ACME must not be replaced by panel defaults.
++	if s.cfg.Cert.PreferLocal {
++		return false
+ 	}
+ 
+ 	// Certificate configuration from panel (panel-first: takes precedence over local config)
+@@ -1158,6 +1163,11 @@
+ 	if !containsString(kcfgSupported, spec.Protocol) {
+ 		return fmt.Errorf("protocol %q is not supported by kernel %q", spec.Protocol, cfg.Kernel.Type)
+ 	}
++	if cfg != nil && cfg.Cert.PreferLocal {
++		local := *spec
++		local.CertConfig = &cfg.Cert
++		spec = &local
++	}
+ 	if err := validateTLSRequirements(spec, tls, cfgKernelType(cfg)); err != nil {
+ 		return err
+ 	}
+--- a/internal/cert/cert.go
++++ b/internal/cert/cert.go
+@@ -440,6 +440,7 @@
+ 	issuer := certmagic.ACMEIssuer{
+ 		CA:    certmagic.LetsEncryptProductionCA,
+ 		Email: m.cfg.Email,
++		Agreed: m.cfg.ACMEAgreed,
+ 	}
+ 
+ 	if dnsSolver != nil {
+--- /dev/null
++++ b/internal/service/installer_cert_test.go
+@@ -0,0 +1,26 @@
++package service
++
++import (
++ "context"
++ "testing"
++ "github.com/cedar2025/xboard-node/internal/config"
++ "github.com/cedar2025/xboard-node/internal/kernel"
++ "github.com/cedar2025/xboard-node/internal/model"
++)
++
++func TestInstallerLocalCertificateSurvivesPanelOverrides(t *testing.T) {
++ cfg := &config.Config{Cert: config.CertConfig{PreferLocal: true, CertMode: "file", CertFile: "local.pem", KeyFile: "local.key", Domain: "local.example.com"}}
++ svc := &Service{cfg: cfg}
++ remote := &model.NodeSpec{AutoTLS: true, Domain: "remote.example.com", CertConfig: &config.CertConfig{CertMode: "none"}}
++ if svc.applyRemoteOverrides(context.Background(), remote) { t.Fatal("local policy changed") }
++ if cfg.Cert.CertMode != "file" || cfg.Cert.CertFile != "local.pem" || cfg.Cert.AutoTLS || cfg.Cert.Domain != "local.example.com" { t.Fatal("panel replaced local policy") }
++}
++
++func TestInstallerLocalCertificateValidationUsesEffectivePolicy(t *testing.T) {
++ cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}, Cert: config.CertConfig{PreferLocal: true, CertMode: "http", Domain: "local.example.com"}}
++ remote := &model.NodeSpec{Protocol: "anytls", CertConfig: &config.CertConfig{CertMode: "dns", DNSProvider: "not-a-provider", Domain: "remote.example.com"}}
++ if err := validateNodeRuntime(cfg, []string{"anytls"}, remote, kernel.TLSCert{}); err != nil { t.Fatalf("local ACME policy rejected: %v", err) }
++ if remote.CertConfig.CertMode != "dns" { t.Fatal("validation mutated panel model") }
++ cfg.Cert.PreferLocal = false
++ if err := validateNodeRuntime(cfg, []string{"anytls"}, remote, kernel.TLSCert{}); err == nil { t.Fatal("default panel-first validation unexpectedly ignored provider") }
++}
