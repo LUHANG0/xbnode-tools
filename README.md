@@ -13,7 +13,7 @@ GitHub Actions 构建，程序从自己的 GitHub Releases 下载。
 安装前在面板创建一个新的节点 ID，设置好协议、服务端口、权限组，并至少有一个
 可用用户。零用户时上游不会启动内核，本工具会在安装前说明并停止。
 
-先发布下面所述的 `v0.1.1` Release。当前仓库为 `LUHANG0/xbnode-tools`；fork 后请替换为自己的仓库：
+当前仓库 `LUHANG0/xbnode-tools` 已发布 [v0.1.1](https://github.com/LUHANG0/xbnode-tools/releases/tag/v0.1.1)，可以直接执行下面的命令。fork 后请先在自己的仓库完成发布，并替换仓库名称：
 
 ```bash
 # Debian / Ubuntu，root 执行
@@ -139,6 +139,11 @@ python3 tools/build.py        # 需要 Go 1.26.10、Git 和 C 编译器（竞态
 bash tools/test-protocols.sh  # 需要 Docker，无外网容器，合成面板/账号/证书
 python3 tools/package.py /tmp/xbnode-tools-source.tar.gz
 ```
+
+[v0.1.1 发布 CI](https://github.com/LUHANG0/xbnode-tools/actions/runs/39825496528) 已通过：
+33 项管理器/引导测试、7 个 Go 包竞态测试，以及 AMD64/ARM64 各七协议的限额
+客户端测试。关键限额测试另在本地连续 20 轮竞态检查通过。协议客户端请求为 TCP
+目标；UDP 目标路径由 Go 路由/调度回归验证。没有用生产客户或节点进行验收。
 
 `release.json` 固定上游提交、Go 工具链与构建选项；`patches/` 保存维护变更。
 更新版本时同步修改 `release.json`、`xbnode.py` 的 VERSION、`install.sh` 的固定
