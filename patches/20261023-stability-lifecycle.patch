@@ -1537,6 +1537,133 @@
  			nlog.Core().Warn("ws: user delta payload has no users")
  			return
  		}
+--- /dev/null
++++ b/internal/service/empty_users_integration_test.go
+@@ -0,0 +1,58 @@
++package service
++
++import (
++	"context"
++	"github.com/cedar2025/xboard-node/internal/cert"
++	"github.com/cedar2025/xboard-node/internal/config"
++	"github.com/cedar2025/xboard-node/internal/kernel/xray"
++	"github.com/cedar2025/xboard-node/internal/limiter"
++	"github.com/cedar2025/xboard-node/internal/model"
++	"github.com/cedar2025/xboard-node/internal/tracker"
++	"net"
++	"strconv"
++	"testing"
++	"time"
++)
++
++func TestRealXrayLastUserRemovalCanResume(t *testing.T) {
++	for _, mode := range []string{"full", "delta"} {
++		t.Run(mode, func(t *testing.T) {
++			listener, err := net.Listen("tcp", "127.0.0.1:0")
++			if err != nil {
++				t.Fatal(err)
++			}
++			port := listener.Addr().(*net.TCPAddr).Port
++			listener.Close()
++			k := xray.New(config.KernelConfig{Type: "xray", ConfigDir: t.TempDir()})
++			defer k.Stop()
++			limits := limiter.New()
++			s := &Service{kernel: k, tracker: tracker.New(), limiter: limits, speedTracker: limiter.NewSpeedTracker(limits), cert: cert.NewManager(config.CertConfig{})}
++			k.SetSpeedLimitFunc(s.speedTracker.GetLimiter)
++			k.SetDeviceLimitFunc(s.limiter.GetDeviceLimitByUUID)
++			s.lastConfig = &model.NodeSpec{Protocol: "vless", ServerPort: port, ListenIP: "127.0.0.1", Network: "tcp"}
++			first := []model.UserSpec{{ID: 901, UUID: "43e50a02-29dd-4d52-b315-d86f3fa14ead"}}
++			s.applyUserUpdate(context.Background(), first, "")
++			if !k.IsRunning() {
++				t.Fatal("initial empty kernel did not start")
++			}
++			s.applyUserDelta(context.Background(), "remove", first)
++			if k.IsRunning() || len(s.lastUsers) != 0 {
++				t.Fatal("last-user removal failed")
++			}
++			replacement := []model.UserSpec{{ID: 901, UUID: "05b693a3-9235-4f83-84b8-b15d8243fbb9"}}
++			if mode == "full" {
++				s.applyUserUpdate(context.Background(), replacement, "")
++			} else {
++				s.applyUserDelta(context.Background(), "add", replacement)
++			}
++			if !k.IsRunning() || len(s.lastUsers) != 1 || s.lastUsers[0].UUID != replacement[0].UUID {
++				t.Fatal("real kernel did not resume")
++			}
++			connection, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), time.Second)
++			if err != nil {
++				t.Fatal("resumed listener missing", err)
++			}
++			connection.Close()
++		})
++	}
++}
+--- /dev/null
++++ b/internal/service/empty_users_test.go
+@@ -0,0 +1,63 @@
++package service
++
++import (
++	"context"
++	"errors"
++	"github.com/cedar2025/xboard-node/internal/model"
++	"testing"
++)
++
++func TestAuthoritativeUsersResumeStoppedEmptyKernel(t *testing.T) {
++	for _, mode := range []string{"full", "delta"} {
++		t.Run(mode, func(t *testing.T) {
++			k := &fakeKernel{}
++			s := newTestService(k)
++			s.lastConfig = &model.NodeSpec{Protocol: "vless"}
++			user := model.UserSpec{ID: 1, UUID: "new-user", SpeedLimit: 8}
++			if mode == "full" {
++				s.applyUserUpdate(context.Background(), []model.UserSpec{user}, "")
++			} else {
++				s.applyUserDelta(context.Background(), "add", []model.UserSpec{user})
++			}
++			if !k.running || k.startCalls != 1 || len(s.lastUsers) != 1 || s.lastUsers[0].UUID != user.UUID {
++				t.Fatalf("running=%v starts=%d users=%v", k.running, k.startCalls, s.lastUsers)
++			}
++			if s.speedTracker.GetLimiter(user.UUID) == nil {
++				t.Fatal("limits not prepared before start")
++			}
++		})
++	}
++}
++func TestEmptyKernelStartFailureCanRetrySameAuthoritativeSet(t *testing.T) {
++	k := &fakeKernel{startErr: errors.New("synthetic startup failure")}
++	s := newTestService(k)
++	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
++	users := []model.UserSpec{{ID: 1, UUID: "new-user"}}
++	s.applyUserUpdate(context.Background(), users, "")
++	if k.running || len(s.lastUsers) != 0 {
++		t.Fatal("failed start committed new state")
++	}
++	k.startErr = nil
++	s.applyUserUpdate(context.Background(), users, "")
++	if !k.running || k.startCalls != 2 {
++		t.Fatal("same payload did not retry")
++	}
++}
++func TestUsersBeforeConfigAreRetainedAndStoppedRemovalIsAuthoritative(t *testing.T) {
++	k := &fakeKernel{}
++	s := newTestService(k)
++	users := []model.UserSpec{{ID: 1, UUID: "new-user"}}
++	s.applyUserUpdate(context.Background(), users, "")
++	if k.running || len(s.lastUsers) != 1 {
++		t.Fatal("users lost before config")
++	}
++	s.applyUserDelta(context.Background(), "remove", users)
++	if len(s.lastUsers) != 0 {
++		t.Fatal("stopped removal ignored")
++	}
++	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
++	s.applyUserDelta(context.Background(), "add", users)
++	if !k.running {
++		t.Fatal("later add did not resume")
++	}
++}
 --- a/internal/service/service.go
 +++ b/internal/service/service.go
 @@ -60,6 +60,7 @@
@@ -1566,15 +1693,51 @@
  			s.pushReportSync()
  			return nil
  
-@@ -777,6 +783,7 @@
- 		return
- 	}
+@@ -770,13 +776,30 @@
  
+ // ─── User update entry points ───────────────────────────────────────────────
+ 
++// A valid set received while there are no users/config must become the
++// next startup state. ensureRunning() only sees the previous set and cannot
++// bootstrap a kernel after its last user was removed.
++func (s *Service) applyStoppedUserSet(users []model.UserSpec) bool {
++	if s.kernel.IsRunning() {
++		return false
++	}
++	previous, hash := s.prepareUserState(users)
++	if s.lastConfig != nil && len(users) > 0 {
++		if !s.startKernel(s.lastConfig, users) {
++			s.restoreUserState(previous, hash)
++		}
++	}
++	return true
++}
++
+ // applyUserUpdate replaces the full user set and hot-swaps the kernel.
+ // Called from WS sync.users and REST polling.
+ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, newHash string) {
+-	if !s.ensureRunning() {
+-		return
+-	}
+-
++	if s.applyStoppedUserSet(users) {
++		return
++	}
++
 +	s.trackAndEnforce(ctx)
  	prevUsers, prevHash := s.prepareUserState(users)
  	added, removed, err := s.kernel.UpdateUsers(users)
  	if err != nil {
-@@ -819,6 +826,12 @@
+@@ -805,7 +828,7 @@
+ 		}
+ 		merged := mergeUsers(s.lastUsers, deltaUsers)
+ 
+-		if !s.ensureRunning() {
++		if s.applyStoppedUserSet(merged) {
+ 			return
+ 		}
+ 
+@@ -819,6 +842,12 @@
  		}
  
  		prevUsers, prevHash := s.prepareUserState(merged)
@@ -1587,7 +1750,7 @@
  		added, err := s.kernel.AddUsers(deltaUsers)
  		if err != nil {
  			nlog.Core().Warn(fmt.Sprintf("AddUsers failed: %v, falling back to UpdateUsers", err))
-@@ -833,6 +846,7 @@
+@@ -833,6 +862,7 @@
  		}
  
  	case "remove":
@@ -1595,7 +1758,15 @@
  		// Defensive check for empty or nil deltaUsers
  		if deltaUsers == nil || len(deltaUsers) == 0 {
  			return
-@@ -942,9 +956,6 @@
+@@ -840,6 +870,7 @@
+ 		filtered := subtractUsers(s.lastUsers, deltaUsers)
+ 
+ 		if !s.kernel.IsRunning() {
++			s.updateUserState(filtered)
+ 			return
+ 		}
+ 
+@@ -942,9 +973,6 @@
  }
  
  func (s *Service) trackAndEnforce(ctx context.Context) {
@@ -1605,7 +1776,7 @@
  
  	traffic, aliveIPs, connCount, err := s.kernel.GetUserTraffic(ctx)
  	if err != nil {
-@@ -952,7 +963,14 @@
+@@ -952,7 +980,14 @@
  		return
  	}
  
@@ -1621,7 +1792,7 @@
  
  	// Only log stats if there's actual traffic or connections
  	if connCount > 0 || len(traffic) > 0 {
-@@ -980,6 +998,7 @@
+@@ -980,6 +1015,7 @@
  		return
  	}
  
@@ -1629,7 +1800,7 @@
  	traffic := s.tracker.FlushTraffic()
  	aliveIPs := s.tracker.SnapshotAliveIPs()
  	online := s.tracker.CurrentOnline()
-@@ -988,7 +1007,13 @@
+@@ -988,7 +1024,13 @@
  	metrics["kernel_status"] = s.kernel.IsRunning()
  
  	go func() {
@@ -1643,7 +1814,7 @@
  		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
  			nlog.Core().Warn("failed to push report", "error", err)
  			if len(traffic) > 0 {
-@@ -1001,16 +1026,26 @@
+@@ -1001,16 +1043,26 @@
  			return
  		}
  		s.pushBackoff.onSuccess()
@@ -1670,7 +1841,7 @@
  	aliveIPs := s.tracker.SnapshotAliveIPs()
  	online := s.tracker.CurrentOnline()
  	status := monitor.Collect()
-@@ -1018,7 +1053,10 @@
+@@ -1018,7 +1070,10 @@
  	metrics["kernel_status"] = s.kernel.IsRunning()
  
  	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
@@ -1682,7 +1853,7 @@
  	}
  }
  
-@@ -1042,6 +1080,9 @@
+@@ -1042,6 +1097,9 @@
  	m["total_connections"] = s.tracker.TotalConnections()
  	m["active_users"] = len(online)
  	m["total_users"] = len(lastUsers)

@@ -13,7 +13,7 @@ GitHub Actions 构建，程序从自己的 GitHub Releases 下载。
 安装前在面板创建一个新的节点 ID，设置好协议、服务端口、权限组，并至少有一个
 可用用户。零用户时上游不会启动内核，本工具会在安装前说明并停止。
 
-本版本为 [v0.2.0](https://github.com/LUHANG0/xbnode-tools/releases/tag/v0.2.0)；正式安装前先确认该 Release 的两架构资产与 SHA256SUMS 已完整发布。fork 后请先在自己的仓库完成发布，并替换仓库名称：
+本版本为 [v0.2.1](https://github.com/LUHANG0/xbnode-tools/releases/tag/v0.2.1)；正式安装前先确认该 Release 的两架构资产与 SHA256SUMS 已完整发布。fork 后请先在自己的仓库完成发布，并替换仓库名称：
 
 ```bash
 # Debian / Ubuntu，root 执行
@@ -48,8 +48,8 @@ xbnode logs 41            # 最近 60 行，已对已知通讯密钥和认证 UR
 xbnode restart 41
 xbnode stop 41
 xbnode start 41
-xbnode update 41 --release v0.2.0
-xbnode update-all --release v0.2.0   # 逐个更新，首个失败即停止后续操作
+xbnode update 41 --release v0.2.1
+xbnode update-all --release v0.2.1   # 逐个更新，首个失败即停止后续操作
 xbnode rollback 41
 xbnode diagnose 41 --json # 本机诊断，缺失数据为 null
 xbnode prune              # 旧程序与快照清理预览
@@ -99,7 +99,7 @@ systemctl 不受本工具事务锁保护，维护时请避免与 xbnode 并行�
 
 在线设备按来源 IP 去重，不是物理设备/UDID。保留 v0.1.1 的 TCP/UDP 原子名额、同 IP 多连接和会话结束释放能力。`device_limit=0` 为不限，降低限额不会主动踢掉存量连接；面板设备快照仅作附加限制，不承诺跨节点原子总数。
 
-v0.2.0 在用户被权威有效列表/删除事件撤销或 UUID 更换时，结束该旧身份的活动代理流，保留其他用户。HY2/TUIC 使用固定用户名作为 QUIC 会话身份，关闭被撤销的 QUIC 会话，重排用户不会把旧会话记到另一用户。Xray 保留 mux/XUDP 的原 Reader 类型，通过原句柄中断被撤销的用户。面板超时、503、无效响应及 WS 断线不当作全员撤销。
+v0.2.1 在用户被权威有效列表/删除事件撤销或 UUID 更换时，结束该旧身份的活动代理流，保留其他用户。HY2/TUIC 使用固定用户名作为 QUIC 会话身份，关闭被撤销的 QUIC 会话，重排用户不会把旧会话记到另一用户。Xray 保留 mux/XUDP 的原 Reader 类型，通过原句柄中断被撤销的用户。面板超时、503、无效响应及 WS 断线不当作全员撤销。
 
 退役统计先把流量交给可重试的上报链路，再释放注册表；迟到的计数回调仍归入原用户。发送前写本地 0600 待发送文件，失败恢复并可在重启后继续。面板没有幂等键，服务端已接收但响应丢失时可能重复上报；这是至少一次交付，不保证 exactly-once。硬杀前尚未采样的内核流量仍可能丢失。不要手工删除运行目录中的 `pending-traffic-*.json`。
 
@@ -116,7 +116,7 @@ python3 xbnode.py diagnose --service xboard-node-36.service --port 30000 --trans
 已用旧版管理器安装的节点，先更新到新版管理器以获得诊断/清理入口；原管理器仍可执行单节点程序升级：
 
 ```bash
-xbnode update 41 --release v0.2.0
+xbnode update 41 --release v0.2.1
 ```
 
 原配置、凭据、证书及失败/中断恢复保持。该命令只操作 `xbnode-ID.service`；手工部署的 36 号服务需要独立备份和受控替换，不自动接管。
@@ -125,7 +125,7 @@ xbnode update 41 --release v0.2.0
 
 1. 将整个目录（含 `.github`、`.gitignore`）上传到一个独立公开仓库根目录。
 2. 默认分支使用 `main`。代码推送触发管理器测试。
-3. 创建并推送未使用的标签 `v0.2.0`。Actions 会校验固定源码、应用补丁、跑 Go 竞态测试，
+3. 创建并推送未使用的标签 `v0.2.1`。Actions 会校验固定源码、应用补丁、跑 Go 竞态测试，
    构建 AMD64/ARM64，并在无外网容器内跑七协议的合成客户端请求、同 IP 继续连接、
    新 IP 超额拒绝和断开后名额复用，另有真实 UDP 目标、用户重排/撤销/UUID 更换、mux/XUDP 与 REALITY+Vision。
 4. 检查 `Build and publish xbnode` 全部成功，Release 出现后才使用安装命令。

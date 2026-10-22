@@ -28,7 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "v0.2.0"
+VERSION = "v0.2.1"
 SCHEMA = 1
 PROTOCOLS = {
     "vless": ("VLESS", "xray", "tcp"),
@@ -58,7 +58,7 @@ def check_id(value):
 
 def check_release(value):
     if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?", value):
-        raise Error("版本号格式错误，例如 v0.2.0。")
+        raise Error("版本号格式错误，例如 v0.2.1。")
     return value
 
 
@@ -808,7 +808,7 @@ class Manager:
     def update(self, node_id=None, release=None, confirmed=False):
         meta = self.select_node(node_id)
         node_id = meta["node_id"]
-        release = check_release(release or self.ui.ask("目标工具 Release 版本，例如 v0.2.0"))
+        release = check_release(release or self.ui.ask("目标工具 Release 版本，例如 v0.2.1"))
         if release == meta["release"]:
             raise Error("该节点已使用此版本。")
         directory = node_dir(node_id)
