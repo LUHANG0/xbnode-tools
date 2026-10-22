@@ -1,0 +1,58 @@
+[
+  {
+    "module": "github.com/sagernet/sing-box",
+    "version": "v1.14.0-alpha.2.0.20260316103356-2e665cb7e295",
+    "path": "protocol/hysteria2/inbound.go",
+    "file": "singbox/protocol/hysteria2/inbound.go",
+    "base_sha256": "d751aa270c791ad8074943370d6d22c546f6b887428b9a6cf40a30058bc3fcbf"
+  },
+  {
+    "module": "github.com/sagernet/sing-box",
+    "version": "v1.14.0-alpha.2.0.20260316103356-2e665cb7e295",
+    "path": "protocol/hysteria2/user.go",
+    "file": "singbox/protocol/hysteria2/user.go",
+    "base_sha256": "de6abb318e2528750eb54c084a1a554646f314928327e7314abc4ff825018ffe"
+  },
+  {
+    "module": "github.com/sagernet/sing-box",
+    "version": "v1.14.0-alpha.2.0.20260316103356-2e665cb7e295",
+    "path": "protocol/tuic/inbound.go",
+    "file": "singbox/protocol/tuic/inbound.go",
+    "base_sha256": "bada6742725122777f41aedefdc9f8f9f0e7ac1b50ba427a0404e8fe44fa600f"
+  },
+  {
+    "module": "github.com/sagernet/sing-box",
+    "version": "v1.14.0-alpha.2.0.20260316103356-2e665cb7e295",
+    "path": "protocol/tuic/user.go",
+    "file": "singbox/protocol/tuic/user.go",
+    "base_sha256": "add51df4a1dcba1ee7f7a36b4789285a2dd548168be4182058013e56fe8c3d51"
+  },
+  {
+    "module": "github.com/sagernet/sing-quic",
+    "version": "v0.6.0",
+    "path": "hysteria2/service.go",
+    "file": "singquic/hysteria2/service.go",
+    "base_sha256": "36f2dac2cfa3c0d2549a10c6b7e703fbc93e6ab901ec90e325889f5b56b1db8d"
+  },
+  {
+    "module": "github.com/sagernet/sing-quic",
+    "version": "v0.6.0",
+    "path": "tuic/service.go",
+    "file": "singquic/tuic/service.go",
+    "base_sha256": "7a12897a672c5f025eb86198bd921916fc052c62499f0b593f1c33f525ee709c"
+  },
+  {
+    "module": "github.com/sagernet/sing-quic",
+    "version": "v0.6.0",
+    "path": "hysteria2/user_retirement_test.go",
+    "file": "singquic/hysteria2/user_retirement_test.go",
+    "base_sha256": null
+  },
+  {
+    "module": "github.com/sagernet/sing-quic",
+    "version": "v0.6.0",
+    "path": "tuic/user_retirement_test.go",
+    "file": "singquic/tuic/user_retirement_test.go",
+    "base_sha256": null
+  }
+]

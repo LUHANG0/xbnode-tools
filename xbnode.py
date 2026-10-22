@@ -28,7 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "v0.1.1"
+VERSION = "v0.2.0"
 SCHEMA = 1
 PROTOCOLS = {
     "vless": ("VLESS", "xray", "tcp"),
@@ -58,7 +58,7 @@ def check_id(value):
 
 def check_release(value):
     if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?", value):
-        raise Error("版本号格式错误，例如 v0.1.1。")
+        raise Error("版本号格式错误，例如 v0.2.0。")
     return value
 
 
@@ -435,6 +435,199 @@ def restore_snapshot(node_id, saved, start=True):
         wait_ready(node_id, meta["spec"], since, 180 if meta["certificate"].get("cert_mode") == "http" else 75)
 
 
+def optional_int(value):
+    try:
+        number = int(value)
+        return number if 0 <= number < 2**63 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def probe_command(*args):
+    try:
+        result = command(*args, check=False)
+        return result.stdout if result.returncode == 0 else None
+    except (Error, OSError):
+        return None
+
+
+def process_sample(pid, proc=Path('/proc')):
+    result = {'rss_bytes': None, 'pss_bytes': None, 'fds': None, 'threads': None, 'cpu_ticks': None}
+    try:
+        for line in (proc / str(pid) / 'status').read_text().splitlines():
+            key, _, value = line.partition(':')
+            if key in ('VmRSS', 'Threads'):
+                number = optional_int(value.split()[0])
+                result['rss_bytes' if key == 'VmRSS' else 'threads'] = number * 1024 if key == 'VmRSS' and number is not None else number
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        fields = (proc / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()
+        result['cpu_ticks'] = int(fields[11]) + int(fields[12])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        result['fds'] = sum(1 for _ in (proc / str(pid) / 'fd').iterdir())
+    except OSError:
+        pass
+    try:
+        for line in (proc / str(pid) / 'smaps_rollup').read_text().splitlines():
+            if line.startswith('Pss:'):
+                result['pss_bytes'] = int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return result
+
+
+def diagnose_service(unit, port=None, transport='tcp', proc=Path('/proc'), sample_seconds=0.25):
+    if not re.fullmatch(r'(?:xbnode|xboard-node)-[1-9][0-9]*\.service', unit):
+        raise Error('仅支持指定的 xbnode-ID / xboard-node-ID 服务。')
+    properties = probe_command('systemctl', 'show', unit, '--property=ActiveState,SubState,MainPID,NRestarts,CPUUsageNSec,MemoryCurrent,ExecMainStartTimestamp')
+    props = dict(line.split('=', 1) for line in (properties or '').splitlines() if '=' in line)
+    pid = optional_int(props.get('MainPID')) or None
+    result = {'service': unit, 'state': props.get('ActiveState'), 'substate': props.get('SubState'), 'pid': pid,
+              'restarts': optional_int(props.get('NRestarts')), 'cpu_total_ns': optional_int(props.get('CPUUsageNSec')),
+              'cgroup_memory_bytes': optional_int(props.get('MemoryCurrent')), 'version': None, 'binary_sha256': None,
+              'cpu_percent_one_core': None, 'loaded_users': None, 'loaded_at': None, 'last_report_at': None,
+              'listener_owned': None, 'business_connectivity': 'unknown', 'rss_bytes': None, 'pss_bytes': None,
+              'fds': None, 'threads': None, 'socket_rows': None}
+    if pid:
+        before = process_sample(pid, proc)
+        started = time.monotonic()
+        time.sleep(sample_seconds)
+        after = process_sample(pid, proc)
+        result.update({k: v for k, v in after.items() if k != 'cpu_ticks'})
+        if before['cpu_ticks'] is not None and after['cpu_ticks'] is not None and after['cpu_ticks'] >= before['cpu_ticks']:
+            result['cpu_percent_one_core'] = round(100 * (after['cpu_ticks'] - before['cpu_ticks']) / os.sysconf('SC_CLK_TCK') / (time.monotonic() - started), 2)
+        executable = proc / str(pid) / 'exe'
+        try:
+            with executable.open('rb') as stream:
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(chunk)
+            result['binary_sha256'] = digest.hexdigest()
+            version = probe_command(str(executable), '-v') or ''
+            match = re.search(r'xboard-node (v[0-9A-Za-z.-]+) \(built ([0-9-]+)\)', version)
+            if match:
+                result['version'] = match.group(1)
+        except OSError:
+            pass
+        sockets = probe_command('ss', '-H', '-lntup')
+        if sockets is not None and port is not None:
+            expected = {'tcp', 'udp'} if transport == 'tcp+udp' else {transport}
+            result['listener_owned'] = expected <= parse_sockets(sockets, port, transport, pid)
+        connections = probe_command('ss', '-H', '-tanup')
+        if connections is not None:
+            result['socket_rows'] = sum('pid=' + str(pid) + ',' in row for row in connections.splitlines())
+    # Only extract known numeric fields and timestamps. Never return raw journal,
+    # URLs, client addresses, UUIDs, command lines or environment variables.
+    journal_args = ['journalctl', '-u', unit, '-b', '-n', '2000', '--no-pager', '-o', 'json']
+    if props.get('ExecMainStartTimestamp'):
+        journal_args += ['--since', props['ExecMainStartTimestamp']]
+    journal = probe_command(*journal_args)
+    for line in (journal or '').splitlines():
+        try:
+            entry = json.loads(line)
+            message = str(entry.get('MESSAGE', ''))
+            stamp = optional_int(entry.get('__REALTIME_TIMESTAMP'))
+            timestamp = dt.datetime.fromtimestamp(stamp / 1e6, dt.timezone.utc).isoformat() if stamp else None
+            match = re.search(r'(?:initial snapshot ready|xray started|sing-box started).*?users=(\d+)|started, (\d+) users|users updated, (\d+) users', message)
+            if match:
+                result['loaded_users'] = int(next(v for v in match.groups() if v is not None))
+                result['loaded_at'] = timestamp
+            delta = re.search(r'users updated: \+(\d+) -(\d+)|users added: \+(\d+)|users removed: -(\d+)', message)
+            if delta and result['loaded_users'] is not None:
+                add, remove, only_add, only_remove = delta.groups()
+                result['loaded_users'] = max(0, result['loaded_users'] + int(add or only_add or 0) - int(remove or only_remove or 0))
+                result['loaded_at'] = timestamp
+            if 'report pushed:' in message:
+                result['last_report_at'] = timestamp
+        except (ValueError, TypeError, OverflowError):
+            continue
+    return result
+
+
+def retention_plan(keep_releases=2, keep_snapshots=3, pins=(), proc=Path('/proc')):
+    if keep_releases < 1 or keep_snapshots < 1:
+        raise Error('至少保留一个版本与一份快照。')
+    roots = [LIB / 'releases', ROOT / 'backups']
+    if any(p.is_symlink() for p in (ROOT, LIB, *roots)):
+        raise Error('管理目录存在符号链接，停止清理。')
+    releases = {p.name: p for p in roots[0].glob('*') if p.is_dir() and not p.is_symlink() and re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', p.name)}
+    protected_versions = set(check_release(p) for p in pins)
+    protected_versions.update(check_release(p) for p in read_json(ROOT / 'settings.json', {}).get('pinned_releases', []))
+    protected_snapshots = set()
+    snapshots = {}
+    # Every snapshot has its own rollback edges. Even an unselected snapshot's
+    # referenced predecessor is protected; graph traversal must never escape.
+    for p in roots[1].glob('*'):
+        if p.is_symlink() or not p.is_dir():
+            continue
+        if (p / 'node.json').is_symlink():
+            raise Error('快照元数据存在符号链接，停止清理。')
+        meta = read_json(p / 'node.json')
+        check_id(meta['node_id']); check_release(meta['release'])
+        snapshots[str(p.resolve())] = (p, meta)
+    nodes = []
+    for p in ROOT.glob('node-*/node.json'):
+        if p.is_symlink() or p.parent.is_symlink():
+            raise Error('节点目录存在符号链接，停止清理。')
+        nodes.append(read_json(p))
+    def protect_meta(meta):
+        protected_versions.add(check_release(meta['release']))
+        previous = meta.get('previous')
+        if previous:
+            saved = Path(previous)
+            if saved.is_symlink() or saved.parent.resolve() != roots[1].resolve():
+                raise Error('回退引用在管理目录之外，停止清理。')
+            key = str(saved.resolve())
+            if key not in snapshots:
+                raise Error('回退引用缺失，停止清理以供排查。')
+            protected_snapshots.add(key)
+    for meta in nodes:
+        protect_meta(meta)
+    for _, meta in snapshots.values():
+        # References are protected regardless of whether this snapshot is kept.
+        if meta.get('previous'):
+            temp = dict(meta); temp['release'] = meta['release']; protect_meta(temp)
+    groups = {}
+    for key, (path, meta) in snapshots.items():
+        groups.setdefault(meta['node_id'], []).append(key)
+    for keys in groups.values():
+        protected_snapshots.update(sorted(keys, reverse=True)[:keep_snapshots])
+    for key in protected_snapshots:
+        protected_versions.add(snapshots[key][1]['release'])
+    def version_key(value):
+        match = re.fullmatch(r'v(\d+)\.(\d+)\.(\d+)', value)
+        return tuple(map(int, match.groups())) if match else (-1, -1, -1)
+    protected_versions.update(sorted(releases, key=version_key, reverse=True)[:keep_releases])
+    # Active executable and unit references protect even older installed copies.
+    unknown_process = False
+    for path in proc.glob('[0-9]*/exe'):
+        try:
+            target = Path(re.sub(r' \(deleted\)$', '', os.readlink(path)))
+            if roots[0] in target.parents:
+                protected_versions.add(target.relative_to(roots[0]).parts[0])
+        except FileNotFoundError:
+            continue
+        except OSError:
+            unknown_process = True
+    if unknown_process:
+        protected_versions.update(releases)
+    for unit in UNITS.glob('xbnode-*.service'):
+        if unit.is_symlink():
+            raise Error('服务文件存在符号链接，停止清理。')
+        for release in re.findall(re.escape(str(roots[0])) + r'/(v[0-9A-Za-z.-]+)/', unit.read_text()):
+            protected_versions.add(release)
+    candidates = [str(path) for name, path in releases.items() if name not in protected_versions]
+    candidates += [str(path) for key, (path, _) in snapshots.items() if key not in protected_snapshots]
+    # Any release needed by a snapshot left on disk is always protected.
+    retained_versions = {meta['release'] for key, (_, meta) in snapshots.items() if str(snapshots[key][0]) not in candidates}
+    candidates = [p for p in candidates if Path(p).parent != roots[0] or Path(p).name not in retained_versions]
+    return {'preview': True, 'candidates': sorted(candidates), 'protected_releases': sorted(protected_versions | retained_versions),
+            'protected_snapshots': sorted(protected_snapshots), 'process_visibility_complete': not unknown_process}
+
+
 class Terminal:
     def __init__(self):
         try:
@@ -799,18 +992,57 @@ class Manager:
         data = re.sub(r"([?&](?:token|key|api_key)=)[^\s&\"']+", r"\1[REDACTED]", data, flags=re.I)
         print(data)
 
+    def diagnose(self, node_id=None, unit=None, port=None, transport='tcp', json_output=False):
+        if unit is None:
+            meta = self.select_node(node_id, include_removed=True)
+            unit = service_name(meta['node_id'])
+            port, transport = meta['spec']['port'], meta['spec']['transport']
+        report = diagnose_service(unit, port, transport)
+        if json_output:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return report
+        labels = {'service':'服务', 'state':'服务状态', 'substate':'运行状态', 'pid':'进程号', 'version':'实际运行版本',
+                  'binary_sha256':'实际程序摘要', 'restarts':'重启次数', 'cpu_percent_one_core':'CPU（单核百分比）',
+                  'cpu_total_ns':'累计 CPU 纳秒', 'rss_bytes':'RSS 字节', 'pss_bytes':'PSS 字节', 'cgroup_memory_bytes':'cgroup 内存字节',
+                  'fds':'句柄数', 'threads':'线程数', 'socket_rows':'该进程 socket 行数', 'listener_owned':'目标监听归属',
+                  'loaded_users':'最近日志中的加载用户数', 'loaded_at':'加载时间（UTC）', 'last_report_at':'最近成功 REST 上报（UTC）'}
+        for key, label in labels.items():
+            print(label + '：' + ('未知/不可用' if report[key] is None else str(report[key])))
+        print('连接可用性：未知；服务 active、日志与监听不能代替真实客户连通验收。RSS、PSS 与 cgroup 口径不同，不相加。')
+        return report
+
+    def prune(self, keep_releases=2, keep_snapshots=3, pins=(), apply=False):
+        plan = retention_plan(keep_releases, keep_snapshots, pins)
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+        if not apply or not plan['candidates']:
+            print('仅预览，没有删除文件。')
+            return plan
+        if not self.ui.confirm('确认只删除以上未被引用的旧程序/快照（不涉及运行数据）'):
+            return plan
+        # Recompute after confirmation while holding the manager mutation lock.
+        fresh = retention_plan(keep_releases, keep_snapshots, pins)
+        if fresh['candidates'] != plan['candidates']:
+            raise Error('保护引用已变化，请重新预览。')
+        for value in fresh['candidates']:
+            path = Path(value)
+            if path.is_symlink() or path.parent not in (LIB / 'releases', ROOT / 'backups'):
+                raise Error('候选路径异常，停止清理。')
+            shutil.rmtree(path)
+        fresh['preview'] = False
+        return fresh
+
     def menu(self):
         while True:
             self.show()
             print("\n1. 添加节点  2. 脱敏日志  3. 启停/重启  4. 更新指定节点")
             print("5. 回退版本  6. 修改节点连接  7. 卸载/保留配置  8. 恢复保留节点  0. 退出")
-            print("9. 依次更新全部节点（失败即停）  10. 更新 TLS 证书")
+            print("9. 依次更新全部节点（失败即停）  10. 更新 TLS 证书  11. 本机诊断  12. 清理预览")
             choice = self.ui.ask("请选择", "0")
             if choice == "0":
                 return
             actions = {"1": self.add, "2": self.logs, "3": self.control, "4": self.update,
                        "5": self.rollback, "6": self.connection, "7": self.uninstall, "8": self.restore,
-                       "9": self.update_all, "10": self.certificate}
+                       "9": self.update_all, "10": self.certificate, "11": self.diagnose, "12": self.prune}
             if choice not in actions:
                 print("选项无效。")
                 continue
@@ -849,12 +1081,20 @@ def require_host():
 
 def main():
     parser = argparse.ArgumentParser(description="Xboard-Node 中文节点管理（不自动迁移现有 XrayR）")
-    parser.add_argument("action", nargs="?", default="menu", choices=["menu", "add", "list", "logs", "start", "stop", "restart", "update", "update-all", "rollback", "connection", "certificate", "uninstall", "restore"])
+    parser.add_argument("action", nargs="?", default="menu", choices=["menu", "add", "list", "logs", "start", "stop", "restart", "update", "update-all", "rollback", "connection", "certificate", "uninstall", "restore", "diagnose", "prune"])
     parser.add_argument("node_id", nargs="?", type=check_id)
     parser.add_argument("--repo")
     parser.add_argument("--release")
     parser.add_argument("--bootstrap-manifest", type=Path)
     parser.add_argument("--version", action="version", version=VERSION)
+    parser.add_argument('--json', action='store_true', dest='json_output')
+    parser.add_argument('--service', help='只读诊断已有 xbnode-ID / xboard-node-ID 服务')
+    parser.add_argument('--port', type=int)
+    parser.add_argument('--transport', choices=['tcp', 'udp', 'tcp+udp'], default='tcp')
+    parser.add_argument('--keep-releases', type=int, default=2)
+    parser.add_argument('--keep-snapshots', type=int, default=3)
+    parser.add_argument('--pin', action='append', default=[])
+    parser.add_argument('--apply', action='store_true', help='预览后还需明确确认才清理')
     args = parser.parse_args()
     require_host()
     os.umask(0o077)
@@ -867,17 +1107,21 @@ def main():
             ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
             manager.install_manager()
         print("管理命令已安装：xbnode。尚未创建或启动任何节点。")
-    elif not (ROOT / "settings.json").exists():
+    elif args.action != "diagnose" and not (ROOT / "settings.json").exists():
         raise Error("请先通过 install.sh 安装管理命令。")
     if args.action == "menu":
         manager.menu()
     elif args.action == "list":
         manager.show()
+    elif args.action == "diagnose":
+        manager.diagnose(args.node_id, args.service, args.port, args.transport, args.json_output)
     elif args.action == "logs":
         manager.logs(args.node_id)
     else:
         with mutation_lock():
-            if args.action in ("start", "stop", "restart"):
+            if args.action == "prune":
+                manager.prune(args.keep_releases, args.keep_snapshots, args.pin, args.apply)
+            elif args.action in ("start", "stop", "restart"):
                 manager.control(args.action, args.node_id)
             elif args.action == "add":
                 manager.add()

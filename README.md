@@ -13,7 +13,7 @@ GitHub Actions 构建，程序从自己的 GitHub Releases 下载。
 安装前在面板创建一个新的节点 ID，设置好协议、服务端口、权限组，并至少有一个
 可用用户。零用户时上游不会启动内核，本工具会在安装前说明并停止。
 
-当前仓库 `LUHANG0/xbnode-tools` 已发布 [v0.1.1](https://github.com/LUHANG0/xbnode-tools/releases/tag/v0.1.1)，可以直接执行下面的命令。fork 后请先在自己的仓库完成发布，并替换仓库名称：
+本版本为 [v0.2.0](https://github.com/LUHANG0/xbnode-tools/releases/tag/v0.2.0)；正式安装前先确认该 Release 的两架构资产与 SHA256SUMS 已完整发布。fork 后请先在自己的仓库完成发布，并替换仓库名称：
 
 ```bash
 # Debian / Ubuntu，root 执行
@@ -48,9 +48,12 @@ xbnode logs 41            # 最近 60 行，已对已知通讯密钥和认证 UR
 xbnode restart 41
 xbnode stop 41
 xbnode start 41
-xbnode update 41 --release v0.2.0    # 示例：只有目标 Release 发布后才可使用
+xbnode update 41 --release v0.2.0
 xbnode update-all --release v0.2.0   # 逐个更新，首个失败即停止后续操作
 xbnode rollback 41
+xbnode diagnose 41 --json # 本机诊断，缺失数据为 null
+xbnode prune              # 旧程序与快照清理预览
+xbnode prune --apply      # 显示候选后仍须输入 yes 确认
 xbnode connection 41      # 修改此节点面板连接，不改其他节点凭据
 xbnode uninstall 41       # 卸载服务，保留配置、证书和恢复快照
 xbnode restore 41
@@ -94,32 +97,37 @@ systemctl 不受本工具事务锁保护，维护时请避免与 xbnode 并行�
 不要复用另一台机器正在运行的节点 ID。面板明确指定不一致的 `kernel_type` 时，
 先在后台核对，安装器不会猜测或悄悄覆盖。
 
-在线设备按来源 IP 去重，不是物理设备/UDID。`v0.1.1` 补齐 sing-box 的 TCP/UDP
-原子限额检查：名额已满时拒绝新 IP，同一 IP 可继续建立连接；最后一条连接关闭
-后释放该 IP 的名额。另修复 Xray 的 Shadowsocks 2022 会话结束后名额滞留，
-并补齐 UDP 流的 IP 占位；通过会话结束或写端关闭任一信号只释放一次，保持
-mux/XUDP 所需的原 Reader 类型。原有完整在线 IP 周期刷新补丁继续保留。
-`device_limit=0` 为不限，不主动踢掉已在线 IP；降低限额不会立即关闭存量连接。
-UDP 名额按流/会话结束或空闲超时释放，后台显示还受上报周期影响。
-sing-box 收到的近期面板设备快照仅作附加限制，不提供跨节点原子占位，因此本工具
-不承诺全账号跨节点的严格总数限制。经过中转时还取决于是否保留真实来源 IP。
+在线设备按来源 IP 去重，不是物理设备/UDID。保留 v0.1.1 的 TCP/UDP 原子名额、同 IP 多连接和会话结束释放能力。`device_limit=0` 为不限，降低限额不会主动踢掉存量连接；面板设备快照仅作附加限制，不承诺跨节点原子总数。
 
-已用本工具安装的节点可在目标机器执行：
+v0.2.0 在用户被权威有效列表/删除事件撤销或 UUID 更换时，结束该旧身份的活动代理流，保留其他用户。HY2/TUIC 使用固定用户名作为 QUIC 会话身份，关闭被撤销的 QUIC 会话，重排用户不会把旧会话记到另一用户。Xray 保留 mux/XUDP 的原 Reader 类型，通过原句柄中断被撤销的用户。面板超时、503、无效响应及 WS 断线不当作全员撤销。
+
+退役统计先把流量交给可重试的上报链路，再释放注册表；迟到的计数回调仍归入原用户。发送前写本地 0600 待发送文件，失败恢复并可在重启后继续。面板没有幂等键，服务端已接收但响应丢失时可能重复上报；这是至少一次交付，不保证 exactly-once。硬杀前尚未采样的内核流量仍可能丢失。不要手工删除运行目录中的 `pending-traffic-*.json`。
+
+本机诊断读取实际 `/proc/PID/exe` 的版本与摘要、CPU、RSS/PSS/cgroup、句柄、监听归属和本轮日志的加载/上报时间；仅输出允许字段。没有权限或日志不足显示未知/JSON null，服务 active 不表示客户连接已验收。可只读诊断手工部署的服务：
 
 ```bash
-xbnode update 41 --release v0.1.1  # 将 41 替换成实际节点 ID
+python3 xbnode.py diagnose --service xboard-node-36.service --port 30000 --transport tcp --json
 ```
 
-旧管理器 `v0.1.0` 可以执行此更新，原配置、凭据和更新回退机制保持。该命令只更新
-所选的 `xbnode-ID.service`，不会自动更新先前手工部署的 36 号服务。
+诊断不接管服务、不显示环境变量/客户端地址/UUID/原日志，不增加监听或常驻采样进程，不设置压低 RSS 的内存限制。AnyTLS 已有会话池可能等到其空闲结束，已撤销身份的代理流会结束，新流会被拒绝；池中的空闲传输不能再获得有效代理权限。
+
+清理默认只预览，默认至少保留最近 2 个版本、每节点最近 3 份快照；可用 `--keep-releases`、`--keep-snapshots`、重复的 `--pin vX.Y.Z` 或 settings.json 的 `pinned_releases` 调整保护。运行程序、服务文件、当前配置及所有快照中的回退引用始终优先保护，引用链可能使保留量高于给定数量。读取不完整/引用异常时停止或保护全部版本，不跟随管理目录外的符号链接。只清理本工具的程序/快照，不处理运行状态、证书或业务数据；本轮没有在生产清理历史文件。
+
+已用旧版管理器安装的节点，先更新到新版管理器以获得诊断/清理入口；原管理器仍可执行单节点程序升级：
+
+```bash
+xbnode update 41 --release v0.2.0
+```
+
+原配置、凭据、证书及失败/中断恢复保持。该命令只操作 `xbnode-ID.service`；手工部署的 36 号服务需要独立备份和受控替换，不自动接管。
 
 ## 自己发布首个版本
 
 1. 将整个目录（含 `.github`、`.gitignore`）上传到一个独立公开仓库根目录。
 2. 默认分支使用 `main`。代码推送触发管理器测试。
-3. 创建并推送标签 `v0.1.1`。Actions 会校验固定源码、应用补丁、跑 Go 竞态测试，
+3. 创建并推送未使用的标签 `v0.2.0`。Actions 会校验固定源码、应用补丁、跑 Go 竞态测试，
    构建 AMD64/ARM64，并在无外网容器内跑七协议的合成客户端请求、同 IP 继续连接、
-   新 IP 超额拒绝和断开后名额复用。
+   新 IP 超额拒绝和断开后名额复用，另有真实 UDP 目标、用户重排/撤销/UUID 更换、mux/XUDP 与 REALITY+Vision。
 4. 检查 `Build and publish xbnode` 全部成功，Release 出现后才使用安装命令。
 
 手动运行 workflow_dispatch 并选择 main 时只构建和测试；选择已存在的版本标签
@@ -140,14 +148,11 @@ bash tools/test-protocols.sh  # 需要 Docker，无外网容器，合成面板/�
 python3 tools/package.py /tmp/xbnode-tools-source.tar.gz
 ```
 
-[v0.1.1 发布 CI](https://github.com/LUHANG0/xbnode-tools/actions/runs/39825496528) 已通过：
-33 项管理器/引导测试、7 个 Go 包竞态测试，以及 AMD64/ARM64 各七协议的限额
-客户端测试。关键限额测试另在本地连续 20 轮竞态检查通过。协议客户端请求为 TCP
-目标；UDP 目标路径由 Go 路由/调度回归验证。没有用生产客户或节点进行验收。
+当前验证范围与证据见 [VALIDATION.md](VALIDATION.md)。`tests/stability_soak.py` 支持固定 1800 秒原生 ARM64 旧/新版本对照，采样内存、CPU、句柄、连接/对象与流量，期间模拟面板和上报 503/恢复。只在 `--network none` 容器中用合成材料运行，不访问生产客户。
 
-`release.json` 固定上游提交、Go 工具链与构建选项；`patches/` 保存维护变更。
-更新版本时同步修改 `release.json`、`xbnode.py` 的 VERSION、`install.sh` 的固定
-版本和发布说明。不得静默追随 upstream latest 覆盖维护补丁。
+`release.json` 固定上游提交与 Go 工具链；原四份维护补丁继续保留，新增生命周期补丁。`overlays/lock.json` 固定受影响依赖的版本和每个原文件摘要，构建把它们复制到独立源码目录后应用替换文件；不修改共享模块缓存。`go.mod`/`go.sum` 保持上游原文件，专用 `maintenance.mod` 仅用相对路径指向包内完整修改后的依赖。发布源码归档可以用 `go build -modfile=maintenance.mod` 配合 manifest 的 tags/版本参数重建。原 v0.1.0/v0.1.1 标签和资产保持。
+
+更新版本时同步 `release.json`、`xbnode.py` 的 VERSION、`install.sh` 的固定版本和发布说明，不追随 upstream latest 覆盖维护补丁。
 
 ## 本机文件
 

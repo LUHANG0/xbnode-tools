@@ -1,0 +1,1922 @@
+--- a/internal/kernel/kernel.go
++++ b/internal/kernel/kernel.go
+@@ -12,6 +12,7 @@
+ )
+ 
+ type Capabilities struct {
++	TrafficDeltas        bool // GetUserTraffic transfers deltas rather than cumulative counters
+ 	PerUserSpeedLimit    bool
+ 	DeviceLimit          bool
+ 	BuiltInTrafficStats  bool
+@@ -80,7 +81,8 @@
+ 
+ 	// ─── Observability ──────────────────────────────────────────────────
+ 	// GetUserTraffic returns per-user cumulative traffic counters and
+-	// per-user alive IP sets. The kernel maintains these internally using
++	// per-user alive IP sets. TrafficDeltas explicitly declares a drained delta
++	// contract; otherwise values are cumulative. The kernel maintains these using
+ 	// per-user atomic counters — no per-connection iteration needed.
+ 	// aliveIPs maps userID → set of source IPs currently connected.
+ 	// traffic maps userID → [upload, download] cumulative bytes.
+@@ -138,7 +140,7 @@
+ 		}
+ 	}
+ 	for _, u := range oldUsers {
+-		if _, exists := newMap[u.ID]; !exists {
++		if next, exists := newMap[u.ID]; !exists || next.UUID != u.UUID {
+ 			toRemove = append(toRemove, u)
+ 		}
+ 	}
+--- a/internal/kernel/singbox/conntracker.go
++++ b/internal/kernel/singbox/conntracker.go
+@@ -35,6 +35,7 @@
+ 
+ 	mu        sync.RWMutex   // RWMutex for concurrent reads
+ 	ips       map[string]int // sourceIP → refcount (number of active conns from that IP)
++	retired   bool           // protected by tracker.usersMu; late counters go to pending
+ 	connCount int            // total active connections
+ }
+ 
+@@ -122,9 +123,10 @@
+ //   - Per-connection rate limit token accumulation (amortized WaitN)
+ type ConnTracker struct {
+ 	usersMu sync.RWMutex
+-	users   map[int]*userStats  // userID → stats
+-	uuidMap map[string]int      // UUID → userID (for lookup in RoutedConnection)
+-	connMap map[string]net.Conn // connID → conn (only for force-close support)
++	users   map[int]*userStats           // userID → stats
++	uuidMap map[string]int               // UUID → userID (for lookup in RoutedConnection)
++	connMap map[string]trackedConnection // TCP and packet sessions, exact authenticated UUID
++	pending map[int][2]int64             // drained byte deltas from detached statistics
+ 
+ 	idCounter atomic.Int64
+ 
+@@ -145,8 +147,9 @@
+ 	return &ConnTracker{
+ 		users:         make(map[int]*userStats),
+ 		uuidMap:       make(map[string]int),
+-		connMap:       make(map[string]net.Conn),
++		connMap:       make(map[string]trackedConnection),
+ 		globalDevices: make(map[int]map[string]bool),
++		pending:       make(map[int][2]int64),
+ 	}
+ }
+ 
+@@ -163,14 +166,75 @@
+ // SetUserMap replaces the UUID→userID mapping and ensures per-user stats
+ // structs exist for all users. Old users that are no longer present keep
+ // their stats until their connections drain.
++type trackedConnection struct {
++	uuid string
++	conn io.Closer
++}
++
+ func (t *ConnTracker) SetUserMap(m map[string]int) {
+ 	t.usersMu.Lock()
+-	t.uuidMap = m
+-	for _, uid := range m {
+-		if _, ok := t.users[uid]; !ok {
++	current := make(map[int]bool, len(m))
++	next := make(map[string]int, len(m))
++	for uuid, uid := range m {
++		next[uuid] = uid
++		current[uid] = true
++		if t.users[uid] == nil {
+ 			t.users[uid] = &userStats{ips: make(map[string]int)}
+ 		}
+ 	}
++	var closing []io.Closer
++	for _, c := range t.connMap {
++		if old, ok := t.uuidMap[c.uuid]; ok && next[c.uuid] != old {
++			closing = append(closing, c.conn)
++		}
++	}
++	t.uuidMap = next
++	for uid, us := range t.users {
++		us.mu.RLock()
++		idle := us.connCount == 0
++		us.mu.RUnlock()
++		if !current[uid] && idle {
++			t.retireLocked(uid, us)
++		}
++	}
++	t.usersMu.Unlock()
++	for _, c := range closing {
++		_ = c.Close()
++	}
++}
++
++// Transfer before detaching. A zero-copy counter can still finish after Close;
++// it retains us and forwards those late bytes into pending instead of losing them.
++func (t *ConnTracker) retireLocked(uid int, us *userStats) {
++	d := t.pending[uid]
++	d[0] += us.upload.Swap(0)
++	d[1] += us.download.Swap(0)
++	if d[0] > 0 || d[1] > 0 {
++		t.pending[uid] = d
++	}
++	us.retired = true
++	delete(t.users, uid)
++}
++func (t *ConnTracker) countBytes(us *userStats, uid int, download bool, n int64) {
++	t.usersMu.RLock()
++	if !us.retired {
++		if download {
++			us.download.Add(n)
++		} else {
++			us.upload.Add(n)
++		}
++		t.usersMu.RUnlock()
++		return
++	}
++	t.usersMu.RUnlock()
++	t.usersMu.Lock()
++	d := t.pending[uid]
++	if download {
++		d[1] += n
++	} else {
++		d[0] += n
++	}
++	t.pending[uid] = d
+ 	t.usersMu.Unlock()
+ }
+ 
+@@ -211,10 +275,9 @@
+ 	uuid := metadata.User
+ 	sourceIP := metadata.Source.Addr.String()
+ 
+-	t.usersMu.RLock()
++	t.usersMu.Lock()
+ 	uid := t.uuidMap[uuid]
+ 	us := t.users[uid]
+-	t.usersMu.RUnlock()
+ 
+ 	// Check and reserve under the same user lock for TCP and UDP alike.
+ 	limit := 0
+@@ -223,7 +286,8 @@
+ 			limit = value
+ 		}
+ 	}
+-	if !t.reserveConn(us, uid, sourceIP, limit) {
++	if us == nil || !t.reserveConn(us, uid, sourceIP, limit) {
++		t.usersMu.Unlock()
+ 		nlog.Core().Info("singbox: device limit gate-keep, rejecting connection",
+ 			"user_id", uid, "limit", limit)
+ 		conn.Close()
+@@ -247,8 +311,7 @@
+ 		limiter:  lim,
+ 		ctx:      ctx,
+ 	}
+-	t.usersMu.Lock()
+-	t.connMap[connID] = wrapped
++	t.connMap[connID] = trackedConnection{uuid, wrapped}
+ 	t.usersMu.Unlock()
+ 	return wrapped
+ }
+@@ -265,10 +328,9 @@
+ 	uuid := metadata.User
+ 	sourceIP := metadata.Source.Addr.String()
+ 
+-	t.usersMu.RLock()
++	t.usersMu.Lock()
+ 	uid := t.uuidMap[uuid]
+ 	us := t.users[uid]
+-	t.usersMu.RUnlock()
+ 
+ 	limit := 0
+ 	if dlf := t.deviceLimitFunc.Load(); dlf != nil {
+@@ -276,7 +338,8 @@
+ 			limit = value
+ 		}
+ 	}
+-	if !t.reserveConn(us, uid, sourceIP, limit) {
++	if us == nil || !t.reserveConn(us, uid, sourceIP, limit) {
++		t.usersMu.Unlock()
+ 		nlog.Core().Info("singbox: device limit gate-keep, rejecting UDP connection",
+ 			"user_id", uid, "limit", limit)
+ 		conn.Close()
+@@ -290,7 +353,7 @@
+ 		lim = (*slf)(uuid)
+ 	}
+ 
+-	return &trackedPacketConn{
++	wrapped := &trackedPacketConn{
+ 		PacketConn: conn,
+ 		tracker:    t,
+ 		us:         us,
+@@ -300,6 +363,9 @@
+ 		limiter:    lim,
+ 		ctx:        ctx,
+ 	}
++	t.connMap[connID] = trackedConnection{uuid, wrapped}
++	t.usersMu.Unlock()
++	return wrapped
+ }
+ 
+ // reserveConn checks distinct source-IP limits and registers the connection in
+@@ -364,27 +430,37 @@
+ 
+ // GetUserTraffic returns per-user cumulative traffic and alive IPs.
+ // This is O(users), not O(connections).
++// GetUserTraffic drains byte deltas. Ownership passes to the service tracker,
++// which retains failed reports independently of user/connection lifetime.
+ func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int) {
+-	t.usersMu.RLock()
+-	traffic = make(map[int][2]int64, len(t.users))
+-	aliveIPs = make(map[int]map[string]bool, len(t.users))
++	t.usersMu.Lock()
++	defer t.usersMu.Unlock()
++	traffic = t.pending
++	t.pending = make(map[int][2]int64)
++	aliveIPs = make(map[int]map[string]bool)
++	current := make(map[int]bool, len(t.uuidMap))
++	for _, uid := range t.uuidMap {
++		current[uid] = true
++	}
+ 	for uid, us := range t.users {
+-		up := us.upload.Load()
+-		down := us.download.Load()
+-		if up > 0 || down > 0 {
+-			traffic[uid] = [2]int64{up, down}
+-		}
+-
+-		ips := us.aliveIPList()
+-		if ips != nil {
++		d := traffic[uid]
++		d[0] += us.upload.Swap(0)
++		d[1] += us.download.Swap(0)
++		if d[0] > 0 || d[1] > 0 {
++			traffic[uid] = d
++		}
++		if ips := us.aliveIPList(); len(ips) > 0 {
+ 			aliveIPs[uid] = ips
+ 		}
+-
+-		us.mu.Lock()
+-		connCount += us.connCount
+-		us.mu.Unlock()
+-	}
+-	t.usersMu.RUnlock()
++		us.mu.RLock()
++		n := us.connCount
++		us.mu.RUnlock()
++		connCount += n
++		if !current[uid] && n == 0 {
++			us.retired = true
++			delete(t.users, uid)
++		}
++	}
+ 	return
+ }
+ 
+@@ -396,18 +472,26 @@
+ 	if !ok {
+ 		return false
+ 	}
+-	if conn != nil {
+-		conn.Close()
++	if conn.conn != nil {
++		conn.conn.Close()
+ 	}
+ 	return true
+ }
+ 
+ // CloseByUUID force-closes ALL connections for a given user UUID.
+ func (t *ConnTracker) CloseByUUID(uuid string) int {
+-	// This is a no-op for now — sing-box doesn't expose per-user connection
+-	// kill easily. The kernel's RemoveUsers removes the inbound user which
+-	// prevents new connections, and existing connections will fail on next I/O.
+-	return 0
++	t.usersMu.RLock()
++	var conns []io.Closer
++	for _, c := range t.connMap {
++		if c.uuid == uuid {
++			conns = append(conns, c.conn)
++		}
++	}
++	t.usersMu.RUnlock()
++	for _, c := range conns {
++		_ = c.Close()
++	}
++	return len(conns)
+ }
+ 
+ // ActiveCount returns the total number of active connections.
+@@ -526,7 +610,7 @@
+ 	n, err := c.Conn.Read(b)
+ 	if n > 0 {
+ 		if c.us != nil {
+-			c.us.upload.Add(int64(n)) // 从入站读取 = 用户上传
++			c.tracker.countBytes(c.us, c.userID, false, int64(n)) // 从入站读取 = 用户上传
+ 		}
+ 		if c.limiter != nil {
+ 			// Non-blocking rate limiting
+@@ -574,7 +658,7 @@
+ 
+ 	n, err := c.Conn.Write(b)
+ 	if n > 0 && c.us != nil {
+-		c.us.download.Add(int64(n)) // 向入站写入 = 用户下载
++		c.tracker.countBytes(c.us, c.userID, true, int64(n)) // 向入站写入 = 用户下载
+ 	}
+ 	return n, err
+ }
+@@ -593,10 +677,10 @@
+ // ReadCounter/WriteCounter unwrap interfaces.
+ func (c *trackedConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
+ 	if c.limiter == nil {
+-		return func(n int64) { counter.Add(n) }
++		return func(n int64) { c.tracker.countBytes(c.us, c.userID, counter == &c.us.download, n) }
+ 	}
+ 	return func(n int64) {
+-		counter.Add(n)
++		c.tracker.countBytes(c.us, c.userID, counter == &c.us.download, n)
+ 		// Non-blocking rate limiting with context cancellation
+ 		if !c.limiter.AllowN(time.Now(), int(n)) {
+ 			resv := c.limiter.ReserveN(time.Now(), int(n))
+@@ -651,7 +735,7 @@
+ 	if err == nil {
+ 		n := int64(buffer.Len())
+ 		if c.us != nil {
+-			c.us.upload.Add(n) // 从入站读取 = 用户上传
++			c.tracker.countBytes(c.us, c.userID, false, n) // 从入站读取 = 用户上传
+ 		}
+ 		if c.limiter != nil {
+ 			// Non-blocking rate limiting with context cancellation
+@@ -697,7 +781,7 @@
+ 
+ 	err := c.PacketConn.WritePacket(buffer, dest)
+ 	if err == nil && c.us != nil {
+-		c.us.download.Add(n) // 向入站写入 = 用户下载
++		c.tracker.countBytes(c.us, c.userID, true, n) // 向入站写入 = 用户下载
+ 	}
+ 	return err
+ }
+@@ -714,10 +798,10 @@
+ 
+ func (c *trackedPacketConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
+ 	if c.limiter == nil {
+-		return func(n int64) { counter.Add(n) }
++		return func(n int64) { c.tracker.countBytes(c.us, c.userID, counter == &c.us.download, n) }
+ 	}
+ 	return func(n int64) {
+-		counter.Add(n)
++		c.tracker.countBytes(c.us, c.userID, counter == &c.us.download, n)
+ 		// Non-blocking rate limiting with context cancellation
+ 		if !c.limiter.AllowN(time.Now(), int(n)) {
+ 			resv := c.limiter.ReserveN(time.Now(), int(n))
+@@ -752,3 +836,9 @@
+ func (c *trackedPacketConn) Upstream() any           { return c.PacketConn }
+ func (c *trackedPacketConn) ReaderReplaceable() bool { return true }
+ func (c *trackedPacketConn) WriterReplaceable() bool { return true }
++
++func (t *ConnTracker) RuntimeStats() map[string]int {
++	t.usersMu.RLock()
++	defer t.usersMu.RUnlock()
++	return map[string]int{"user_stats": len(t.users), "tracked_sessions": len(t.connMap), "pending_users": len(t.pending)}
++}
+--- /dev/null
++++ b/internal/kernel/singbox/retirement_test.go
+@@ -0,0 +1,65 @@
++package singbox
++
++import (
++	"fmt"
++	"testing"
++)
++
++func TestRetiredUsersConverge(t *testing.T) {
++	ct := NewConnTracker(0)
++	for i := 1; i <= 10000; i++ {
++		ct.SetUserMap(map[string]int{fmt.Sprint(i): i})
++	}
++	if len(ct.users) != 1 {
++		t.Fatalf("retained %d users for one current user", len(ct.users))
++	}
++}
++func TestCloseUUIDActuallyClosesOnlyMatchingTCPAndUDP(t *testing.T) {
++	ct := NewConnTracker(0)
++	ct.SetUserMap(map[string]int{"old": 1, "valid": 2})
++	a := ct.RoutedConnection(nil, &testConn{}, testInboundContext("old", "203.0.113.1"), nil, nil)
++	b := ct.RoutedConnection(nil, &testConn{}, testInboundContext("valid", "203.0.113.2"), nil, nil)
++	defer b.Close()
++	defer a.Close()
++	if n := ct.CloseByUUID("old"); n != 1 {
++		t.Fatalf("closed=%d", n)
++	}
++	if ct.ActiveCount() != 1 {
++		t.Fatalf("active=%d", ct.ActiveCount())
++	}
++}
++
++func TestRetiredTailAndReaddedID(t *testing.T) {
++	ct := NewConnTracker(0)
++	ct.SetUserMap(map[string]int{"old": 1})
++	c, _ := routeLimited(ct, false, "old", "203.0.113.1")
++	tc := c.(*trackedConn)
++	callback := tc.makeCountFunc(&tc.us.upload)
++	callback(10)
++	ct.SetUserMap(map[string]int{"new": 1})
++	if ct.ActiveCount() != 0 {
++		t.Fatal("old identity retained")
++	}
++	a, _, _ := ct.GetUserTraffic()
++	if a[1][0] != 10 {
++		t.Fatal(a)
++	}
++	ct.SetUserMap(nil)
++	ct.GetUserTraffic()
++	if len(ct.users) != 0 {
++		t.Fatal("idle user retained")
++	}
++	callback(7) // late zero-copy completion after stats detached
++	ct.SetUserMap(map[string]int{"newer": 1})
++	d, _ := routeLimited(ct, true, "newer", "203.0.113.2")
++	defer d.Close()
++	pc := d.(*trackedPacketConn)
++	pc.tracker.countBytes(pc.us, pc.userID, false, 4)
++	a, _, _ = ct.GetUserTraffic()
++	if a[1][0] != 11 {
++		t.Fatalf("tail+readded traffic=%v", a)
++	}
++	if n := ct.CloseByUUID("newer"); n != 1 || ct.ActiveCount() != 0 {
++		t.Fatal("UDP not revoked")
++	}
++}
+--- a/internal/kernel/singbox/singbox.go
++++ b/internal/kernel/singbox/singbox.go
+@@ -79,6 +79,7 @@
+ 		AliveIPTracking:      true,
+ 		ForceCloseConnection: false,
+ 		ForceCloseUser:       true,
++		TrafficDeltas:        true,
+ 	}
+ }
+ 
+@@ -139,8 +140,10 @@
+ 	s.nodeConfig = nodeConfig
+ 	s.tls = tls
+ 
+-	// Fresh tracker on full restart.
+-	s.connTracker = NewConnTracker(0)
++	// Keep byte ownership and late callbacks across a full restart.
++	if s.connTracker == nil {
++		s.connTracker = NewConnTracker(0)
++	}
+ 	s.connTracker.SetUserMap(buildUserMap(users))
+ 	if s.speedLimitFunc != nil {
+ 		s.connTracker.SetSpeedLimitFunc(s.speedLimitFunc)
+@@ -435,26 +438,26 @@
+ 		return 0, fmt.Errorf("not running")
+ 	}
+ 
+-	existing := make(map[int]struct{}, len(s.users))
++	next := make(map[int]model.UserSpec, len(s.users))
+ 	for _, u := range s.users {
+-		existing[u.ID] = struct{}{}
+-	}
+-	var toAdd []model.UserSpec
++		next[u.ID] = u
++	}
++	added := 0
+ 	for _, u := range users {
+-		if _, dup := existing[u.ID]; !dup {
+-			toAdd = append(toAdd, u)
+-		}
+-	}
+-	if len(toAdd) == 0 {
+-		return 0, nil
+-	}
+-
+-	merged := append(append([]model.UserSpec{}, s.users...), toAdd...)
++		if old, ok := next[u.ID]; !ok || old.UUID != u.UUID {
++			added++
++		}
++		next[u.ID] = u
++	}
++	merged := make([]model.UserSpec, 0, len(next))
++	for _, u := range next {
++		merged = append(merged, u)
++	}
+ 	if err := s.reloadInboundsLocked(merged); err != nil {
+ 		return 0, err
+ 	}
+ 	s.users = merged
+-	return len(toAdd), nil
++	return added, nil
+ }
+ 
+ // RemoveUsers hot-swaps users out of running inbounds. Zero connection disruption
+@@ -655,3 +658,11 @@
+ 	}
+ 	return m
+ }
++
++func (s *SingBox) RuntimeStats() map[string]int {
++	ct := s.connTrackerSafe()
++	if ct == nil {
++		return nil
++	}
++	return ct.RuntimeStats()
++}
+--- a/internal/kernel/xray/dispatcher.go
++++ b/internal/kernel/xray/dispatcher.go
+@@ -12,6 +12,7 @@
+ 	"github.com/xtls/xray-core/common"
+ 	"github.com/xtls/xray-core/common/buf"
+ 	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
+ 	"github.com/xtls/xray-core/common/session"
+ 	"github.com/xtls/xray-core/features/routing"
+ 	"github.com/xtls/xray-core/transport"
+@@ -79,6 +80,10 @@
+ 	// Each entry is *ipCounter{ips sync.Map}.
+ 	unlimitedIPs sync.Map // email → *ipCounter
+ 
++	accounts  map[string]protocol.Account
++	blocked   map[string]bool
++	sessions  map[string]map[uint64]func()
++	sessionID atomic.Uint64
+ 	connCount atomic.Int64 // total active connections tracked by dispatcher
+ }
+ 
+@@ -107,8 +112,10 @@
+ 		return nil, err
+ 	}
+ 
++	ctx, cancel := context.WithCancel(ctx)
+ 	link, err := d.innerDisp.Dispatch(ctx, dest)
+ 	if err != nil {
++		cancel()
+ 		if email != "" {
+ 			d.delConn(email, sourceIP)
+ 		}
+@@ -116,7 +123,7 @@
+ 	}
+ 
+ 	if email != "" {
+-		d.trackLink(ctx, link, email, sourceIP, isTCP)
++		d.trackCancelableLink(ctx, link, email, sourceIP, isTCP, cancel)
+ 	}
+ 	return link, nil
+ }
+@@ -127,13 +134,15 @@
+ 		return err
+ 	}
+ 
++	ctx, cancel := context.WithCancel(ctx)
+ 	var release func()
+ 	if email != "" {
+-		release = d.trackLink(ctx, link, email, sourceIP, isTCP)
++		release = d.trackCancelableLink(ctx, link, email, sourceIP, isTCP, cancel)
+ 	}
+ 	err = d.innerDisp.DispatchLink(ctx, dest, link)
+ 	if err != nil && release != nil {
+ 		release()
++		cancel()
+ 	}
+ 	return err
+ }
+@@ -147,6 +156,12 @@
+ 		return "", "", false, nil
+ 	}
+ 	email = si.User.Email
++	d.mu.RLock()
++	allowed := ctx.Err() == nil && d.authorizedLocked(ctx, email)
++	d.mu.RUnlock()
++	if !allowed {
++		return "", "", false, errors.New("user revoked")
++	}
+ 	sourceIP = si.Source.Address.IP().String()
+ 	isTCP = dest.Network == net.Network_TCP
+ 
+@@ -160,26 +175,79 @@
+ // trackLink records connection lifecycle without mutating xray-core owned
+ // transport primitives. This keeps mux/XUDP compatible while still allowing
+ // the dispatcher to release device-limit state when the link closes.
+-func (d *LimitDispatcher) trackLink(ctx context.Context, link *transport.Link, email, sourceIP string, _ bool) func() {
++func (d *LimitDispatcher) trackLink(ctx context.Context, link *transport.Link, email, sourceIP string, tcp bool) func() {
++	return d.trackCancelableLink(ctx, link, email, sourceIP, tcp, func() {})
++}
++func (d *LimitDispatcher) authorizedLocked(ctx context.Context, email string) bool {
++	if d.blocked[email] {
++		return false
++	}
++	if d.emailToUID != nil && d.emailToUID[email] == 0 {
++		return false
++	}
++	if account := d.accounts[email]; account != nil {
++		si := session.InboundFromContext(ctx)
++		return si != nil && si.User != nil && si.User.Account != nil && account.Equals(si.User.Account)
++	}
++	return true
++}
++func (d *LimitDispatcher) trackCancelableLink(ctx context.Context, link *transport.Link, email, sourceIP string, _ bool, cancel context.CancelFunc) func() {
++	id := d.sessionID.Add(1)
+ 	d.connCount.Add(1)
+ 	var once sync.Once
+ 	release := func() {
+ 		once.Do(func() {
+ 			d.delConn(email, sourceIP)
++			d.mu.Lock()
++			delete(d.sessions[email], id)
++			if len(d.sessions[email]) == 0 {
++				delete(d.sessions, email)
++			}
++			d.mu.Unlock()
+ 			d.connCount.Add(-1)
+ 		})
+ 	}
+-	// Some inbound bridges (notably Shadowsocks 2022) do not close the
+-	// returned link writer. Their worker context still ends with the session.
+-	// Preserve the concrete reader required by mux/XUDP and release once on
+-	// either writer close/interrupt or context cancellation.
+ 	stop := context.AfterFunc(ctx, release)
+-	onClose := func() {
+-		stop()
+-		release()
+-	}
++	onClose := func() { stop(); release(); cancel() }
++	kill := func() { cancel(); common.Interrupt(link.Reader); common.Interrupt(link.Writer); onClose() }
++	d.mu.Lock()
++	if d.sessions == nil {
++		d.sessions = make(map[string]map[uint64]func())
++	}
++	allowed := ctx.Err() == nil && d.authorizedLocked(ctx, email)
++	if allowed {
++		if d.sessions[email] == nil {
++			d.sessions[email] = make(map[uint64]func())
++		}
++		d.sessions[email][id] = kill
++	}
++	d.mu.Unlock()
++	if !allowed {
++		kill()
++		return onClose
++	}
++	// Preserve Reader's concrete type for mux/XUDP. Interrupt the original
++	// primitives through saved handles when revoking, never wrap the reader.
+ 	link.Writer = &closeTrackingWriter{Writer: link.Writer, onClose: onClose}
+ 	return onClose
++}
++func (d *LimitDispatcher) closeEmail(email string, revoke bool) int {
++	d.mu.Lock()
++	if revoke {
++		if d.blocked == nil {
++			d.blocked = make(map[string]bool)
++		}
++		d.blocked[email] = true
++	}
++	var closing []func()
++	for _, fn := range d.sessions[email] {
++		closing = append(closing, fn)
++	}
++	d.mu.Unlock()
++	for _, fn := range closing {
++		fn()
++	}
++	return len(closing)
+ }
+ 
+ // ─── features.Feature (delegated) ───────────────────────────────────────────
+@@ -206,6 +274,34 @@
+ 	d.mu.Lock()
+ 	d.emailToUID = emailToUID
+ 	d.deviceLimits = deviceLimits
++	for email := range d.blocked {
++		if emailToUID[email] != 0 {
++			delete(d.blocked, email)
++		}
++	}
++	// Admission and release use one lock even while limits change.
++	d.unlimitedIPs.Range(func(key, value interface{}) bool {
++		email := key.(string)
++		if deviceLimits[email] > 0 {
++			ips := make(map[string]int)
++			value.(*ipCounter).ips.Range(func(k, v interface{}) bool { ips[k.(string)] = int(v.(*atomic.Int64).Load()); return true })
++			d.limitedIPs[email] = ips
++			d.unlimitedIPs.Delete(email)
++		}
++		return true
++	})
++	for email, ips := range d.limitedIPs {
++		if deviceLimits[email] <= 0 {
++			ic := &ipCounter{}
++			for ip, n := range ips {
++				v := &atomic.Int64{}
++				v.Store(int64(n))
++				ic.ips.Store(ip, v)
++			}
++			d.unlimitedIPs.Store(email, ic)
++			delete(d.limitedIPs, email)
++		}
++	}
+ 	d.mu.Unlock()
+ 
+ }
+@@ -230,13 +326,11 @@
+ 	d.mu.RLock()
+ 	emailToUID := d.emailToUID
+ 	limitedIPs := d.limitedIPs
+-	d.mu.RUnlock()
+ 
+ 	aliveIPs = make(map[int]map[string]bool)
+ 
+ 	// Copy limited IPs while holding the lock; connection admission/removal
+ 	// mutates these maps concurrently.
+-	d.mu.RLock()
+ 	for email, ipsMap := range limitedIPs {
+ 		uid := emailToUID[email]
+ 		if uid == 0 {
+@@ -283,61 +377,48 @@
+ // Fast path: unlimited users use lock-free sync.Map.
+ // Both TCP and UDP reserve a reference until their tracked flow ends.
+ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, _ bool) bool {
+-	d.mu.RLock()
+-	limit, hasLimit := d.deviceLimits[email]
+-	d.mu.RUnlock()
+-
+-	// Fast path: no device limit — retain traffic-independent IP tracking.
+-	if !hasLimit || limit <= 0 {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if d.blocked[email] || (d.emailToUID != nil && d.emailToUID[email] == 0) {
++		return true
++	}
++	limit := d.deviceLimits[email]
++	if limit <= 0 {
+ 		v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
+ 		ic := v.(*ipCounter)
+ 		rv, _ := ic.ips.LoadOrStore(sourceIP, &atomic.Int64{})
+ 		rv.(*atomic.Int64).Add(1)
+ 		return false
+ 	}
+-
+-	// Reserve a new source IP atomically. A new lexicographically smaller IP
+-	// must not bypass the limit while the existing connections remain active.
+-	d.mu.Lock()
+-	defer d.mu.Unlock()
+-
+ 	ips := d.limitedIPs[email]
+ 	if ips == nil {
+ 		ips = make(map[string]int)
+ 		d.limitedIPs[email] = ips
+ 	}
+-
+-	if ips[sourceIP] > 0 {
++	if ips[sourceIP] > 0 || len(ips) < limit {
+ 		ips[sourceIP]++
+ 		return false
+ 	}
+-
+-	if len(ips) < limit {
+-		ips[sourceIP]++
+-		return false
+-	}
+-
+ 	return true
+ }
+-
+-// delConn decrements the IP refcount when a connection closes.
+ func (d *LimitDispatcher) delConn(email, sourceIP string) {
+-	// Check if this is an unlimited user first (lock-free).
++	d.mu.Lock()
++	defer d.mu.Unlock()
+ 	if v, ok := d.unlimitedIPs.Load(email); ok {
+ 		ic := v.(*ipCounter)
+ 		if rv, ok := ic.ips.Load(sourceIP); ok {
+-			counter := rv.(*atomic.Int64)
+-			if counter.Add(-1) <= 0 {
++			if rv.(*atomic.Int64).Add(-1) <= 0 {
+ 				ic.ips.Delete(sourceIP)
+ 			}
+ 		}
++		empty := true
++		ic.ips.Range(func(_, _ interface{}) bool { empty = false; return false })
++		if empty {
++			d.unlimitedIPs.Delete(email)
++		}
+ 		return
+ 	}
+-
+-	// Limited user — use write lock.
+-	d.mu.Lock()
+-	defer d.mu.Unlock()
+-	if ips, ok := d.limitedIPs[email]; ok {
++	if ips := d.limitedIPs[email]; ips != nil {
+ 		ips[sourceIP]--
+ 		if ips[sourceIP] <= 0 {
+ 			delete(ips, sourceIP)
+--- /dev/null
++++ b/internal/kernel/xray/retirement_test.go
+@@ -0,0 +1,117 @@
++package xray
++
++import (
++	"context"
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/transport"
++	"sync"
++	"testing"
++)
++
++func TestLedgerRetirementLateBytesAndSameID(t *testing.T) {
++	m := newTrafficStatsManager(newStatsManager(t), nil)
++	c, err := m.RegisterCounter(counterName(1, "uplink"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	c.Add(10)
++	if got := m.drain()[1][0]; got != 10 {
++		t.Fatal(got)
++	}
++	m.retain(nil)
++	if len(m.counters) != 0 {
++		t.Fatal("retained counter")
++	}
++	c.Add(7)
++	m.retain(map[int]bool{1: true})
++	newer, _ := m.RegisterCounter(counterName(1, "uplink"))
++	newer.Add(4)
++	if got := m.drain()[1][0]; got != 11 {
++		t.Fatal(got)
++	}
++	m.retain(nil)
++	late, _ := m.RegisterCounter(counterName(1, "downlink"))
++	late.Add(9)
++	if len(m.counters) != 0 {
++		t.Fatal("late registration retained retired user")
++	}
++	if m.drain()[1][1] != 9 {
++		t.Fatal("late registration tail lost")
++	}
++	var wg sync.WaitGroup
++	for i := 0; i < 8; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for j := 0; j < 1000; j++ {
++				c.Add(1)
++			}
++		}()
++	}
++	wg.Wait()
++	if got := m.drain()[1][0]; got != 8000 {
++		t.Fatal(got)
++	}
++	if len(m.counters) != 0 {
++		t.Fatal("unbounded counter registry")
++	}
++}
++func TestUnlimitedTableConvergesAndLimitTransition(t *testing.T) {
++	d := newTestDispatcher()
++	for i := 0; i < 10000; i++ {
++		email := userEmail(i + 1)
++		if d.checkDeviceLimit(email, "203.0.113.1", false) {
++			t.Fatal("unlimited rejected")
++		}
++		d.delConn(email, "203.0.113.1")
++	}
++	n := 0
++	d.unlimitedIPs.Range(func(_, _ interface{}) bool { n++; return true })
++	if n != 0 {
++		t.Fatal(n)
++	}
++	email := userEmail(1)
++	d.UpdateLimits(map[string]int{email: 1}, nil, nil)
++	d.checkDeviceLimit(email, "203.0.113.1", true)
++	d.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 1}, nil)
++	if !d.checkDeviceLimit(email, "203.0.113.2", true) {
++		t.Fatal("transition lost occupied IP")
++	}
++	d.delConn(email, "203.0.113.1")
++	if d.checkDeviceLimit(email, "203.0.113.2", false) {
++		t.Fatal("slot not released")
++	}
++	d.delConn(email, "203.0.113.2")
++}
++func TestRevocationInterruptsOnlyExactUserAndPreservesReader(t *testing.T) {
++	d := newTestDispatcher()
++	d.UpdateLimits(map[string]int{userEmail(1): 1, userEmail(2): 2}, nil, nil)
++	for _, id := range []int{1, 2} {
++		email := userEmail(id)
++		d.checkDeviceLimit(email, "203.0.113.1", true)
++		reader := &nopReader{}
++		link := &transport.Link{Reader: reader, Writer: &testWriter{}}
++		_ = link
++		// Use existing synthetic writer whose Interrupt has no dependency on a real pipe.
++		link.Writer = &testWriter{}
++		d.trackLink(context.Background(), link, email, "203.0.113.1", true)
++		if link.Reader != reader {
++			t.Fatal("reader wrapped")
++		}
++	}
++	if n := d.closeEmail(userEmail(1), true); n != 1 {
++		t.Fatal(n)
++	}
++	if d.connCount.Load() != 1 {
++		t.Fatal(d.connCount.Load())
++	}
++	d.closeEmail(userEmail(2), true)
++	if d.connCount.Load() != 0 {
++		t.Fatal("connections retained")
++	}
++}
++
++type testWriter struct{}
++
++func (*testWriter) WriteMultiBuffer(b buf.MultiBuffer) error { buf.ReleaseMulti(b); return nil }
++func (*testWriter) Interrupt()                               {}
+--- /dev/null
++++ b/internal/kernel/xray/traffic_ledger.go
+@@ -0,0 +1,174 @@
++package xray
++
++// Keep counters held by an old xray stream usable after its user is retired.
++// The registry forgets the counter, but its late Add calls forward to the same
++// ledger. A re-added ID receives a fresh counter without losing either tail.
++import (
++	"context"
++	"fmt"
++	appstats "github.com/xtls/xray-core/app/stats"
++	"github.com/xtls/xray-core/features/stats"
++	"reflect"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++)
++
++type trafficLedger struct {
++	mu      sync.Mutex
++	pending map[int][2]int64
++}
++
++func newTrafficLedger() *trafficLedger { return &trafficLedger{pending: make(map[int][2]int64)} }
++func (l *trafficLedger) add(uid, dir int, n int64) {
++	if n <= 0 {
++		return
++	}
++	l.mu.Lock()
++	v := l.pending[uid]
++	v[dir] += n
++	l.pending[uid] = v
++	l.mu.Unlock()
++}
++func (l *trafficLedger) drain() map[int][2]int64 {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	p := l.pending
++	l.pending = make(map[int][2]int64)
++	return p
++}
++
++type ledgerCounter struct {
++	value    atomic.Int64
++	owner    *trafficStatsManager
++	uid, dir int
++	detached bool
++}
++
++func (c *ledgerCounter) Value() int64      { return c.value.Load() }
++func (c *ledgerCounter) Set(n int64) int64 { return c.value.Swap(n) }
++func (c *ledgerCounter) Add(n int64) int64 {
++	m := c.owner
++	m.mu.RLock()
++	defer m.mu.RUnlock()
++	if c.detached {
++		m.ledger.add(c.uid, c.dir, n)
++	}
++	return c.value.Add(n)
++}
++
++type trafficStatsManager struct {
++	stats.Manager
++	mu           sync.RWMutex
++	counters     map[string]*ledgerCounter
++	ledger       *trafficLedger
++	currentUsers map[int]bool
++	configured   bool
++}
++
++func newTrafficStatsManager(base stats.Manager, l *trafficLedger) *trafficStatsManager {
++	if l == nil {
++		l = newTrafficLedger()
++	}
++	return &trafficStatsManager{Manager: base, counters: make(map[string]*ledgerCounter), ledger: l}
++}
++func trafficCounterID(name string) (uid, dir int, ok bool) {
++	parts := strings.Split(name, ">>>")
++	if len(parts) != 4 || parts[0] != "user" || parts[2] != "traffic" {
++		return
++	}
++	id := strings.TrimPrefix(parts[1], "user@")
++	uid, e := strconv.Atoi(id)
++	if e != nil || uid <= 0 {
++		return 0, 0, false
++	}
++	if parts[3] == "uplink" {
++		return uid, 0, true
++	}
++	if parts[3] == "downlink" {
++		return uid, 1, true
++	}
++	return 0, 0, false
++}
++func (m *trafficStatsManager) RegisterCounter(name string) (stats.Counter, error) {
++	uid, dir, ok := trafficCounterID(name)
++	if !ok {
++		return m.Manager.RegisterCounter(name)
++	}
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	if m.counters[name] != nil {
++		return nil, fmt.Errorf("counter exists")
++	}
++	c := &ledgerCounter{owner: m, uid: uid, dir: dir}
++	if m.configured && !m.currentUsers[uid] {
++		c.detached = true
++		return c, nil
++	}
++	m.counters[name] = c
++	return c, nil
++}
++func (m *trafficStatsManager) GetCounter(name string) stats.Counter {
++	_, _, ok := trafficCounterID(name)
++	if !ok {
++		return m.Manager.GetCounter(name)
++	}
++	m.mu.RLock()
++	defer m.mu.RUnlock()
++	if c := m.counters[name]; c != nil {
++		return c
++	}
++	return nil
++}
++func (m *trafficStatsManager) UnregisterCounter(name string) error {
++	_, _, ok := trafficCounterID(name)
++	if !ok {
++		return m.Manager.UnregisterCounter(name)
++	}
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	if c := m.counters[name]; c != nil {
++		m.detach(name, c)
++	}
++	return nil
++}
++func (m *trafficStatsManager) detach(name string, c *ledgerCounter) {
++	c.detached = true
++	m.ledger.add(c.uid, c.dir, c.value.Swap(0))
++	delete(m.counters, name)
++}
++func (m *trafficStatsManager) retain(users map[int]bool) {
++	m.mu.Lock()
++	m.currentUsers = users
++	m.configured = true
++	defer m.mu.Unlock()
++	for name, c := range m.counters {
++		if !users[c.uid] {
++			m.detach(name, c)
++		}
++	}
++}
++func (m *trafficStatsManager) drain() map[int][2]int64 {
++	m.mu.Lock()
++	for _, c := range m.counters {
++		m.ledger.add(c.uid, c.dir, c.value.Swap(0))
++	}
++	m.mu.Unlock()
++	return m.ledger.drain()
++}
++
++// xrayCreationMu serializes this temporary build context and dispatcher capture.
++var creationLedger *trafficLedger
++
++func init() {
++	typ := reflect.TypeOf((*appstats.Config)(nil))
++	orig := typeCreatorRegistry[typ]
++	typeCreatorRegistry[typ] = func(ctx context.Context, cfg interface{}) (interface{}, error) {
++		base, err := orig(ctx, cfg)
++		if err != nil {
++			return nil, err
++		}
++		return newTrafficStatsManager(base.(stats.Manager), creationLedger), nil
++	}
++}
+--- a/internal/kernel/xray/xray.go
++++ b/internal/kernel/xray/xray.go
+@@ -4,6 +4,7 @@
+ 	"bytes"
+ 	"context"
+ 	"crypto/sha256"
++	"encoding/base64"
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
+@@ -15,9 +16,9 @@
+ 	"github.com/xtls/xray-core/common/protocol"
+ 	"github.com/xtls/xray-core/common/uuid"
+ 	xrayCore "github.com/xtls/xray-core/core"
++	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
+ 	"github.com/xtls/xray-core/features/inbound"
+ 	"github.com/xtls/xray-core/features/stats"
+-	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
+ 	"github.com/xtls/xray-core/infra/conf/serial"
+ 	xrayProxy "github.com/xtls/xray-core/proxy"
+ 	"github.com/xtls/xray-core/proxy/shadowsocks"
+@@ -32,8 +33,8 @@
+ 	"github.com/cedar2025/xboard-node/internal/config"
+ 	"github.com/cedar2025/xboard-node/internal/kernel"
+ 	"github.com/cedar2025/xboard-node/internal/kernel/geodata"
++	"github.com/cedar2025/xboard-node/internal/model"
+ 	"github.com/cedar2025/xboard-node/internal/nlog"
+-	"github.com/cedar2025/xboard-node/internal/model"
+ )
+ 
+ const (
+@@ -66,6 +67,7 @@
+ 	protocol        string
+ 	inboundTag      string
+ 	lastKernelHash  string
++	ledger          *trafficLedger
+ 	cumTraffic      map[int][2]int64
+ 	speedLimitFunc  func(string) *rate.Limiter
+ 
+@@ -77,6 +79,7 @@
+ func New(cfg config.KernelConfig) *Xray {
+ 	return &Xray{
+ 		cfg:        cfg,
++		ledger:     newTrafficLedger(),
+ 		cumTraffic: make(map[int][2]int64),
+ 	}
+ }
+@@ -90,7 +93,8 @@
+ 		BuiltInTrafficStats:  true,
+ 		AliveIPTracking:      true,
+ 		ForceCloseConnection: false,
+-		ForceCloseUser:       false,
++		ForceCloseUser:       true,
++		TrafficDeltas:        true,
+ 	}
+ }
+ 
+@@ -130,7 +134,9 @@
+ 
+ 	// ── Phase 2: Create instance (global lock for LD capture) ───────────
+ 	xrayCreationMu.Lock()
++	creationLedger = x.ledger
+ 	inst, err := xrayCore.New(pbConfig)
++	creationLedger = nil
+ 	ld := globalLimitDispatcher.Load()
+ 	xrayCreationMu.Unlock()
+ 	if err != nil {
+@@ -147,6 +153,7 @@
+ 	x.mu.Lock()
+ 	old := x.instance
+ 	oldLD := x.limitDispatcher
++	oldUsers := x.users
+ 	x.instance = inst
+ 	x.limitDispatcher = ld
+ 	x.users = users
+@@ -159,6 +166,18 @@
+ 	x.running.Store(true)
+ 	x.mu.Unlock()
+ 
++	if oldLD != nil {
++		_, removed := kernel.UserDiff(oldUsers, users)
++		for _, u := range removed {
++			oldLD.closeEmail(userEmail(u.ID), true)
++		}
++	}
++	if old != nil {
++		if m, ok := old.GetFeature(stats.ManagerType()).(*trafficStatsManager); ok {
++			m.retain(nil)
++		}
++	}
++
+ 	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
+ 	closeOld(old, oldLD)
+ 
+@@ -208,9 +227,22 @@
+ 	x.mu.Unlock()
+ 
+ 	if ld != nil {
+-		drainConns(ld, drainTimeout)
+-	}
+-	closeOld(inst, ld)
++		ld.mu.RLock()
++		var emails []string
++		for email := range ld.sessions {
++			emails = append(emails, email)
++		}
++		ld.mu.RUnlock()
++		for _, email := range emails {
++			ld.closeEmail(email, true)
++		}
++	}
++	if inst != nil {
++		inst.Close()
++		if m, ok := inst.GetFeature(stats.ManagerType()).(*trafficStatsManager); ok {
++			m.retain(nil)
++		}
++	}
+ }
+ 
+ func (x *Xray) IsRunning() bool { return x.running.Load() }
+@@ -227,7 +259,7 @@
+ // so traffic accounting must come from xray-core itself.
+ func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
+ 	if !x.running.Load() {
+-		return nil, nil, 0, nil
++		return x.ledger.drain(), nil, 0, nil
+ 	}
+ 
+ 	x.mu.Lock()
+@@ -250,8 +282,21 @@
+ 	return nil
+ }
+ 
+-func (x *Xray) CloseUserConnections(_ context.Context, _ string) error {
+-	// No-op: handled by RemoveUsers at the xray core level.
++func (x *Xray) CloseUserConnections(_ context.Context, uuid string) error {
++	x.mu.Lock()
++	ld := x.limitDispatcher
++	var emails []string
++	for _, u := range x.users {
++		if u.UUID == uuid {
++			emails = append(emails, userEmail(u.ID))
++		}
++	}
++	x.mu.Unlock()
++	if ld != nil {
++		for _, email := range emails {
++			ld.closeEmail(email, false)
++		}
++	}
+ 	return nil
+ }
+ 
+@@ -287,6 +332,30 @@
+ // dispatcher limits — even when no brand-new users need to be added.
+ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
+ 	x.mu.Lock()
++	var replaced []model.UserSpec
++	for _, next := range users {
++		for _, old := range x.users {
++			if next.ID == old.ID && next.UUID != old.UUID {
++				replaced = append(replaced, old)
++			}
++		}
++	}
++	x.mu.Unlock()
++	if len(replaced) > 0 {
++		if _, err := x.RemoveUsers(replaced); err != nil {
++			return 0, err
++		}
++		if !x.IsRunning() {
++			x.mu.Lock()
++			nc, t := x.nodeConfig, x.tls
++			x.mu.Unlock()
++			if err := x.Start(nc, users, t); err != nil {
++				return 0, err
++			}
++			return len(users), nil
++		}
++	}
++	x.mu.Lock()
+ 	if x.instance == nil {
+ 		x.mu.Unlock()
+ 		return 0, fmt.Errorf("not running")
+@@ -314,7 +383,7 @@
+ 		x.users = merged
+ 		x.mu.Unlock()
+ 		x.updateDispatcherLimits(merged)
+-	x.updateBandwidthLimits(merged)
++		x.updateBandwidthLimits(merged)
+ 		return 0, nil
+ 	}
+ 
+@@ -385,9 +454,21 @@
+ 		x.mu.Unlock()
+ 		return 0, nil
+ 	}
+-
+ 	if len(kept) == 0 {
+-		x.mu.Unlock()
++		ld := x.limitDispatcher
++		inst := x.instance
++		x.users = nil
++		x.mu.Unlock()
++		if ld != nil {
++			for _, u := range users {
++				ld.closeEmail(userEmail(u.ID), true)
++			}
++		}
++		if inst != nil {
++			if m, ok := inst.GetFeature(stats.ManagerType()).(*trafficStatsManager); ok {
++				m.retain(nil)
++			}
++		}
+ 		x.Stop()
+ 		return removed, nil
+ 	}
+@@ -408,6 +489,12 @@
+ 	actualRemoved := 0
+ 	for _, u := range users {
+ 		email := userEmail(u.ID)
++		x.mu.Lock()
++		ld := x.limitDispatcher
++		x.mu.Unlock()
++		if ld != nil {
++			ld.closeEmail(email, true)
++		}
+ 		if err := um.RemoveUser(ctx, email); err != nil {
+ 			nlog.Core().Debug("xray: RemoveUser skipped", "user", u.ID, "error", err)
+ 			continue
+@@ -468,6 +555,12 @@
+ 	// Remove first, then add (order matters for UUID changes on same ID)
+ 	for _, u := range toRemove {
+ 		email := userEmail(u.ID)
++		x.mu.Lock()
++		ld := x.limitDispatcher
++		x.mu.Unlock()
++		if ld != nil {
++			ld.closeEmail(email, true)
++		}
+ 		if err := um.RemoveUser(ctx, email); err != nil {
+ 			nlog.Core().Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
+ 		}
+@@ -572,7 +665,9 @@
+ 	case "shadowsocks":
+ 		if strings.HasPrefix(nc.Cipher, "2022-blake3-") {
+ 			// 2022-blake3 multi-user mode
+-			mu.Account = &ss2022.MemoryAccount{Key: u.UUID}
++			raw := make([]byte, ss2022Methods[nc.Cipher].size)
++			copy(raw, u.UUID)
++			mu.Account = &ss2022.MemoryAccount{Key: base64.StdEncoding.EncodeToString(raw)}
+ 		} else {
+ 			// Traditional SS — build via getCipher path
+ 			ct := parseCipherType(nc.Cipher)
+@@ -716,6 +811,9 @@
+ 		return nil, nil
+ 	}
+ 
++	if m, ok := mgr.(*trafficStatsManager); ok {
++		return m.drain(), nil
++	}
+ 	traffic := make(map[int][2]int64)
+ 	for _, u := range x.users {
+ 		email := userEmail(u.ID)
+@@ -729,14 +827,7 @@
+ 		}
+ 
+ 		if dUp > 0 || dDown > 0 {
+-			cum := x.cumTraffic[u.ID]
+-			cum[0] += dUp
+-			cum[1] += dDown
+-			x.cumTraffic[u.ID] = cum
+-		}
+-
+-		if cum := x.cumTraffic[u.ID]; cum[0] > 0 || cum[1] > 0 {
+-			traffic[u.ID] = cum
++			traffic[u.ID] = [2]int64{dUp, dDown}
+ 		}
+ 	}
+ 	return traffic, nil
+@@ -782,7 +873,19 @@
+ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
+ 	x.mu.Lock()
+ 	ld := x.limitDispatcher
+-	x.mu.Unlock()
++	inst := x.instance
++	nc := x.nodeConfig
++	proto := x.protocol
++	x.mu.Unlock()
++	retained := make(map[int]bool)
++	for _, u := range users {
++		retained[u.ID] = true
++	}
++	if inst != nil {
++		if m, ok := inst.GetFeature(stats.ManagerType()).(*trafficStatsManager); ok {
++			m.retain(retained)
++		}
++	}
+ 	if ld == nil {
+ 		return
+ 	}
+@@ -800,6 +903,17 @@
+ 		}
+ 	}
+ 
++	accounts := make(map[string]protocol.Account)
++	if nc != nil {
++		for _, u := range users {
++			if mu, err := toMemoryUser(proto, nc, u); err == nil {
++				accounts[userEmail(u.ID)] = mu.Account
++			}
++		}
++	}
++	ld.mu.Lock()
++	ld.accounts = accounts
++	ld.mu.Unlock()
+ 	ld.UpdateLimits(emailToUID, deviceLimits, nil)
+ }
+ 
+@@ -807,3 +921,31 @@
+ // so that concurrent Xray instances in multi-node mode each capture their
+ // own LimitDispatcher.
+ var xrayCreationMu sync.Mutex
++
++func (x *Xray) RuntimeStats() map[string]int {
++	x.mu.Lock()
++	inst, ld := x.instance, x.limitDispatcher
++	x.mu.Unlock()
++	out := map[string]int{}
++	if inst != nil {
++		if m, ok := inst.GetFeature(stats.ManagerType()).(*trafficStatsManager); ok {
++			m.mu.RLock()
++			out["counter_objects"] = len(m.counters)
++			m.mu.RUnlock()
++		}
++	}
++	x.ledger.mu.Lock()
++	out["pending_users"] = len(x.ledger.pending)
++	x.ledger.mu.Unlock()
++	if ld != nil {
++		ld.mu.RLock()
++		out["session_users"] = len(ld.sessions)
++		out["limited_users"] = len(ld.limitedIPs)
++		ld.mu.RUnlock()
++		n := 0
++		ld.unlimitedIPs.Range(func(_, _ interface{}) bool { n++; return true })
++		out["unlimited_users"] = n
++		out["tracked_sessions"] = int(ld.connCount.Load())
++	}
++	return out
++}
+--- a/internal/kernel/xray/xray_test.go
++++ b/internal/kernel/xray/xray_test.go
+@@ -109,11 +109,11 @@
+ 	if err != nil {
+ 		t.Fatalf("second GetUserTraffic() error = %v", err)
+ 	}
+-	if got := traffic[1]; got != [2]int64{130, 240} {
+-		t.Fatalf("traffic[1] after second poll = %v, want [130 240]", got)
+-	}
+-	if got := traffic[2]; got != [2]int64{50, 80} {
+-		t.Fatalf("traffic[2] after second poll = %v, want [50 80]", got)
++	if got := traffic[1]; got != [2]int64{30, 40} {
++		t.Fatalf("traffic[1] after second poll = %v, want [30 40]", got)
++	}
++	if got := traffic[2]; got != [2]int64{} {
++		t.Fatalf("traffic[2] after second poll = %v, want [0 0]", got)
+ 	}
+ }
+ 
+@@ -162,18 +162,16 @@
+ 	}
+ }
+ 
+-
+ func TestXrayCapabilities(t *testing.T) {
+ 	x := New(config.KernelConfig{Type: "xray"})
+ 	caps := x.Capabilities()
+ 	if !caps.PerUserSpeedLimit || !caps.DeviceLimit || !caps.BuiltInTrafficStats || !caps.AliveIPTracking {
+ 		t.Fatalf("unexpected positive xray capabilities: %+v", caps)
+ 	}
+-	if caps.ForceCloseConnection || caps.ForceCloseUser {
++	if caps.ForceCloseConnection || !caps.ForceCloseUser || !caps.TrafficDeltas {
+ 		t.Fatalf("unexpected force-close xray capabilities: %+v", caps)
+ 	}
+ }
+-
+ 
+ func TestXrayUpdateBandwidthLimitsWritesPatchedCoreFeature(t *testing.T) {
+ 	inst := new(xrayCore.Instance)
+@@ -189,7 +187,6 @@
+ 		t.Fatal("expected patched bandwidth feature to receive user limiter")
+ 	}
+ }
+-
+ 
+ func TestXrayUpdateBandwidthLimitsUsesSpeedLimitFunc(t *testing.T) {
+ 	inst := new(xrayCore.Instance)
+@@ -213,7 +210,6 @@
+ 	}
+ }
+ 
+-
+ func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
+ 	inst := new(xrayCore.Instance)
+ 	bm := featurebandwidth.New()
+@@ -229,7 +225,6 @@
+ 	}
+ }
+ 
+-
+ func TestXrayUpdateUsersLimitOnlyRefreshesDispatcherAndBandwidth(t *testing.T) {
+ 	x := New(config.KernelConfig{Type: "xray"})
+ 	ld := newTestDispatcher()
+--- a/internal/panel/ws.go
++++ b/internal/panel/ws.go
+@@ -393,7 +393,7 @@
+ 			nlog.Core().Warn("ws: cannot decode users payload", "error", err)
+ 			return
+ 		}
+-		if len(p.Users) == 0 {
++		if p.Users == nil {
+ 			nlog.Core().Warn("ws: users payload empty")
+ 			return
+ 		}
+@@ -411,7 +411,7 @@
+ 			nlog.Core().Warn("ws: user delta payload missing action")
+ 			return
+ 		}
+-		if len(p.Users) == 0 {
++		if p.Users == nil {
+ 			nlog.Core().Warn("ws: user delta payload has no users")
+ 			return
+ 		}
+--- a/internal/service/service.go
++++ b/internal/service/service.go
+@@ -60,6 +60,7 @@
+ 	pushBackoff    apiBackoff // backoff for panel push failures
+ 
+ 	// pushActive prevents overlapping push/pull goroutines.
++	reportMu   sync.Mutex // serializes outbox/report and shutdown flush
+ 	pushActive atomic.Bool
+ 	pullActive atomic.Bool
+ 	// pullResults delivers async pullViaAPI results back to the main goroutine.
+@@ -169,6 +170,9 @@
+ }
+ 
+ func (s *Service) Run(ctx context.Context) error {
++	if err := s.loadTraffic(); err != nil {
++		return err
++	}
+ 	// Start cert manager (handles auto-TLS or manual cert verification)
+ 	if err := s.cert.Start(ctx); err != nil {
+ 		return fmt.Errorf("cert manager: %w", err)
+@@ -205,6 +209,8 @@
+ 	for {
+ 		select {
+ 		case <-ctx.Done():
++			s.kernel.Stop()
++			s.trackAndEnforce(context.Background())
+ 			s.pushReportSync()
+ 			return nil
+ 
+@@ -777,6 +783,7 @@
+ 		return
+ 	}
+ 
++	s.trackAndEnforce(ctx)
+ 	prevUsers, prevHash := s.prepareUserState(users)
+ 	added, removed, err := s.kernel.UpdateUsers(users)
+ 	if err != nil {
+@@ -819,6 +826,12 @@
+ 		}
+ 
+ 		prevUsers, prevHash := s.prepareUserState(merged)
++		if !s.kernel.IsRunning() {
++			if !s.startKernel(s.lastConfig, merged) {
++				s.restoreUserState(prevUsers, prevHash)
++			}
++			return
++		}
+ 		added, err := s.kernel.AddUsers(deltaUsers)
+ 		if err != nil {
+ 			nlog.Core().Warn(fmt.Sprintf("AddUsers failed: %v, falling back to UpdateUsers", err))
+@@ -833,6 +846,7 @@
+ 		}
+ 
+ 	case "remove":
++		s.trackAndEnforce(ctx)
+ 		// Defensive check for empty or nil deltaUsers
+ 		if deltaUsers == nil || len(deltaUsers) == 0 {
+ 			return
+@@ -942,9 +956,6 @@
+ }
+ 
+ func (s *Service) trackAndEnforce(ctx context.Context) {
+-	if !s.kernel.IsRunning() {
+-		return
+-	}
+ 
+ 	traffic, aliveIPs, connCount, err := s.kernel.GetUserTraffic(ctx)
+ 	if err != nil {
+@@ -952,7 +963,14 @@
+ 		return
+ 	}
+ 
+-	s.tracker.Process(traffic, aliveIPs, connCount)
++	if s.tracker == nil {
++		return
++	}
++	if s.kernel.Capabilities().TrafficDeltas {
++		s.tracker.ProcessDeltas(traffic, aliveIPs, connCount)
++	} else {
++		s.tracker.Process(traffic, aliveIPs, connCount)
++	}
+ 
+ 	// Only log stats if there's actual traffic or connections
+ 	if connCount > 0 || len(traffic) > 0 {
+@@ -980,6 +998,7 @@
+ 		return
+ 	}
+ 
++	s.reportMu.Lock()
+ 	traffic := s.tracker.FlushTraffic()
+ 	aliveIPs := s.tracker.SnapshotAliveIPs()
+ 	online := s.tracker.CurrentOnline()
+@@ -988,7 +1007,13 @@
+ 	metrics["kernel_status"] = s.kernel.IsRunning()
+ 
+ 	go func() {
++		defer s.reportMu.Unlock()
+ 		defer s.pushActive.Store(false)
++		if err := s.saveTraffic(traffic); err != nil {
++			s.tracker.RestoreTraffic(traffic)
++			nlog.Core().Warn("cannot persist traffic outbox; report deferred", "error", err)
++			return
++		}
+ 		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+ 			nlog.Core().Warn("failed to push report", "error", err)
+ 			if len(traffic) > 0 {
+@@ -1001,16 +1026,26 @@
+ 			return
+ 		}
+ 		s.pushBackoff.onSuccess()
++		if err := s.clearTraffic(); err != nil {
++			nlog.Core().Warn("cannot clear delivered traffic outbox", "error", err)
++		}
+ 		nlog.ReportPushed(len(traffic), len(online))
+ 	}()
+ }
+ 
+ // pushReportSync is used only during shutdown to ensure final data is sent.
+ func (s *Service) pushReportSync() {
++	s.reportMu.Lock()
++	defer s.reportMu.Unlock()
+ 	if !s.sink.SupportsReporting() {
+ 		return
+ 	}
+ 	traffic := s.tracker.FlushTraffic()
++	if err := s.saveTraffic(traffic); err != nil {
++		s.tracker.RestoreTraffic(traffic)
++		nlog.Core().Warn("cannot persist final traffic outbox", "error", err)
++		return
++	}
+ 	aliveIPs := s.tracker.SnapshotAliveIPs()
+ 	online := s.tracker.CurrentOnline()
+ 	status := monitor.Collect()
+@@ -1018,7 +1053,10 @@
+ 	metrics["kernel_status"] = s.kernel.IsRunning()
+ 
+ 	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+-		nlog.Core().Warn("failed to push final report", "error", err)
++		s.tracker.RestoreTraffic(traffic)
++		nlog.Core().Warn("failed to push final report; pending traffic retained", "error", err)
++	} else if err := s.clearTraffic(); err != nil {
++		nlog.Core().Warn("cannot clear delivered traffic outbox", "error", err)
+ 	}
+ }
+ 
+@@ -1042,6 +1080,9 @@
+ 	m["total_connections"] = s.tracker.TotalConnections()
+ 	m["active_users"] = len(online)
+ 	m["total_users"] = len(lastUsers)
++	if observer, ok := s.kernel.(interface{ RuntimeStats() map[string]int }); ok {
++		m["kernel_objects"] = observer.RuntimeStats()
++	}
+ 
+ 	// Speed
+ 	m["inbound_speed"] = s.tracker.InboundSpeed()
+--- /dev/null
++++ b/internal/service/traffic_spool.go
+@@ -0,0 +1,87 @@
++package service
++
++import (
++	"crypto/sha256"
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++)
++
++// One node/panel-specific local outbox. The panel has no idempotency key, so
++// a timeout after server acceptance can still repeat a report (at-least-once).
++func (s *Service) spoolPath() string {
++	if s.cfg == nil || s.cfg.Kernel.ConfigDir == "" {
++		return ""
++	}
++	id := fmt.Sprintf("%s|%d|%s", s.cfg.Panel.URL, s.cfg.Panel.NodeID, s.cfg.InstanceID)
++	return filepath.Join(s.cfg.Kernel.ConfigDir, fmt.Sprintf("pending-traffic-%x.json", sha256.Sum256([]byte(id))))
++}
++func (s *Service) saveTraffic(data map[int][2]int64) error {
++	p := s.spoolPath()
++	if p == "" {
++		return nil
++	}
++	if len(data) == 0 {
++		return nil
++	}
++	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
++		return err
++	}
++	raw, err := json.Marshal(data)
++	if err != nil {
++		return err
++	}
++	f, err := os.CreateTemp(filepath.Dir(p), ".traffic-*")
++	if err != nil {
++		return err
++	}
++	defer os.Remove(f.Name())
++	if _, err = f.Write(raw); err != nil {
++		f.Close()
++		return err
++	}
++	if err = f.Sync(); err != nil {
++		f.Close()
++		return err
++	}
++	if err = f.Close(); err != nil {
++		return err
++	}
++	return os.Rename(f.Name(), p)
++}
++func (s *Service) loadTraffic() error {
++	p := s.spoolPath()
++	if p == "" {
++		return nil
++	}
++	raw, err := os.ReadFile(p)
++	if os.IsNotExist(err) {
++		return nil
++	}
++	if err != nil {
++		return err
++	}
++	var pending map[int][2]int64
++	if err = json.Unmarshal(raw, &pending); err != nil {
++		return fmt.Errorf("invalid pending traffic outbox: %w", err)
++	}
++	for uid, d := range pending {
++		if uid <= 0 || d[0] < 0 || d[1] < 0 {
++			return fmt.Errorf("invalid pending traffic outbox values")
++		}
++	}
++	s.tracker.RestoreTraffic(pending)
++	return nil
++}
++func (s *Service) clearTraffic() error {
++	p := s.spoolPath()
++	if p == "" {
++		return nil
++	}
++	err := os.Remove(p)
++	if os.IsNotExist(err) {
++		return nil
++	}
++	return err
++}
+--- /dev/null
++++ b/internal/service/traffic_spool_test.go
+@@ -0,0 +1,39 @@
++package service
++
++import (
++	"github.com/cedar2025/xboard-node/internal/config"
++	"github.com/cedar2025/xboard-node/internal/tracker"
++	"os"
++	"testing"
++)
++
++func TestOutboxPreservesTrafficAcrossRestartAndPanelIsolation(t *testing.T) {
++	cfg := &config.Config{Kernel: config.KernelConfig{ConfigDir: t.TempDir()}, Panel: config.PanelConfig{URL: "https://synthetic.example", NodeID: 41}}
++	a := &Service{cfg: cfg, tracker: tracker.New()}
++	if err := a.saveTraffic(map[int][2]int64{1: {10, 20}}); err != nil {
++		t.Fatal(err)
++	}
++	st, _ := os.Stat(a.spoolPath())
++	if st.Mode().Perm() != 0600 {
++		t.Fatal(st.Mode())
++	}
++	b := &Service{cfg: cfg, tracker: tracker.New()}
++	if err := b.loadTraffic(); err != nil {
++		t.Fatal(err)
++	}
++	if b.tracker.FlushTraffic()[1] != [2]int64{10, 20} {
++		t.Fatal("traffic lost")
++	}
++	changed := *cfg
++	changed.Panel.NodeID = 42
++	c := &Service{cfg: &changed, tracker: tracker.New()}
++	if c.spoolPath() == b.spoolPath() {
++		t.Fatal("outbox identity collision")
++	}
++	if err := b.clearTraffic(); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(b.spoolPath()); !os.IsNotExist(err) {
++		t.Fatal(err)
++	}
++}
+--- /dev/null
++++ b/internal/tracker/retirement_test.go
+@@ -0,0 +1,47 @@
++package tracker
++
++import (
++	"sync"
++	"testing"
++)
++
++func TestDeltaHandoffRetirementAndFailedReport(t *testing.T) {
++	tkr := New()
++	var expected int64
++	for id := 1; id <= 10000; id++ {
++		tkr.ProcessDeltas(map[int][2]int64{id: {1, 2}}, nil, 0)
++		expected++
++	}
++	batch := tkr.FlushTraffic()
++	if len(batch) != 10000 {
++		t.Fatal(len(batch))
++	}
++	tkr.ProcessDeltas(nil, nil, 0)
++	if len(tkr.lastSeen) != 0 {
++		t.Fatal("delta path retained historical series")
++	}
++	var wg sync.WaitGroup
++	wg.Add(2)
++	go func() { defer wg.Done(); tkr.RestoreTraffic(batch) }()
++	go func() { defer wg.Done(); tkr.ProcessDeltas(map[int][2]int64{1: {7, 3}}, nil, 0) }()
++	wg.Wait()
++	var actual int64
++	for _, d := range tkr.FlushTraffic() {
++		actual += d[0]
++	}
++	if actual != expected+7 {
++		t.Fatal(actual, expected)
++	}
++	if tkr.HasTraffic() {
++		t.Fatal("pending not drained")
++	}
++}
++func TestCumulativeLastSeenConverges(t *testing.T) {
++	tkr := New()
++	for i := 1; i <= 10000; i++ {
++		tkr.Process(map[int][2]int64{i: {1, 1}}, nil, 0)
++	}
++	if len(tkr.lastSeen) != 1 {
++		t.Fatal(len(tkr.lastSeen))
++	}
++}
+--- a/internal/tracker/tracker.go
++++ b/internal/tracker/tracker.go
+@@ -113,6 +113,13 @@
+ 		}
+ 	}
+ 
++	// Missing cumulative series have ended; pending report deltas remain owned here.
++	for uid := range t.lastSeen {
++		if _, ok := cumTraffic[uid]; !ok {
++			delete(t.lastSeen, uid)
++		}
++	}
++
+ 	// Compute online from alive IPs.
+ 	online := make(map[int]int, len(kernelAliveIPs))
+ 	for uid, ips := range kernelAliveIPs {
+@@ -128,6 +135,29 @@
+ 		inSpeed:   cycleIn,
+ 		outSpeed:  cycleOut,
+ 	})
++}
++
++// ProcessDeltas takes ownership of a kernel's drained counters. Pending data
++// survives user retirement and RestoreTraffic merges in-flight failed reports.
++func (t *Tracker) ProcessDeltas(delta map[int][2]int64, alive map[int]map[string]bool, count int) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	var in, out int64
++	for uid, d := range delta {
++		v := t.pendingTraffic[uid]
++		v[0] += d[0]
++		v[1] += d[1]
++		if v[0] > 0 || v[1] > 0 {
++			t.pendingTraffic[uid] = v
++		}
++		out += d[0]
++		in += d[1]
++	}
++	online := make(map[int]int, len(alive))
++	for uid, ips := range alive {
++		online[uid] = len(ips)
++	}
++	t.live.Store(&snapshot{aliveIPs: alive, online: online, connCount: count, inSpeed: in, outSpeed: out})
+ }
+ 
+ // FlushTraffic returns accumulated per-user traffic and resets the pending buffer.

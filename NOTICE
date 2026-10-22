@@ -7,3 +7,9 @@ Dependency notices and licenses remain with the corresponding Go modules.
 
 The independent installer and its tests are also provided under MPL-2.0.
 No production credentials, customer records, or certificates are included.
+
+The v0.2.0 source archive also includes the complete modified sources of the
+pinned sing-box replacement and sing-quic modules. Original versions and file
+SHA-256 values are recorded in overlays/lock.json and manifest.json. Their
+original LICENSE/NOTICE files are retained in maintenance-dependencies. The
+upstream go.mod/go.sum are unchanged; maintenance.mod selects local copies.
