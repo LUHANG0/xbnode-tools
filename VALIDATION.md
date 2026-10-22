@@ -49,3 +49,6 @@
 
 
 最终发布核验完成：[v0.2.1 Release](https://github.com/LUHANG0/xbnode-tools/releases/tag/v0.2.1)与[标签CI39847887396](https://github.com/LUHANG0/xbnode-tools/actions/runs/39847887396)的build/publish均成功。实际从公开HTTPS下载8项资产及SHA256SUMS，全部摘要通过；manifest的tool_commit精确等于42118b4标签，源码1180文件与本地有效源码逐字节相同，两架构程序与最终长测/分支CI冻结摘要相同。
+
+
+部署辅助工具补充（Release资产不变）：后续提交4742066修正Type=simple启动窗口，先确认/proc/PID/exe已为目标程序，再严格检查UID；真正目标程序以root运行仍拒绝，观察期不放宽。新增针对executor/真实root的回归，全42项本地41通过/1Linux专用跳过，Linux隔离容器受控工具3项通过。标签CI仍对应原41项，不能将后续工具专项记作标签CI检查。
