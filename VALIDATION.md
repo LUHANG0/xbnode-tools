@@ -15,8 +15,10 @@
 - TLS 协议故意收到面板 `cert_config: none`，本地证书优先策略仍生效。
 - 没有修改、重启正式 36 号节点、XBoard 面板、其他落地节点或 sign 应用。
 
-CI 还会在 Ubuntu 用真实 systemd-analyze 检查生成的服务单元，并重复管理器、
-Go 竞态测试及两个架构的七协议合成请求。
+GitHub Ubuntu CI 已完成全部 33 项管理器/引导检查，包括真实 systemd-analyze
+解析服务单元；七个 Go 包竞态测试和双架构七协议合成请求均成功。
+[首次发布运行](https://github.com/LUHANG0/xbnode-tools/actions/runs/39818982539)
+的 build / publish 两个任务均成功，发布了 v0.1.0。
 
 这些检查不等于新主机公网接入验收：云安全组、中转映射、运营商网络、真实客户
 连接及生产域名的公开 CA 证书签发/续期，需要在目标主机核验。本轮没有申请真实
