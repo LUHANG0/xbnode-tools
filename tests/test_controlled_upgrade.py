@@ -10,6 +10,15 @@ spec=importlib.util.spec_from_file_location('controlled_upgrade',Path(__file__).
 u=importlib.util.module_from_spec(spec);spec.loader.exec_module(u)
 
 class ControlledUpgradeTests(unittest.TestCase):
+    def test_startup_waits_for_exec_but_actual_root_program_is_rejected(self):
+        props={'MainPID':'123','ActiveState':'active','SubState':'running','DynamicUser':'yes','User':'node'}
+        with patch.object(u,'properties',return_value=props),patch.object(u.os,'readlink',return_value='/usr/lib/systemd/systemd'):
+            with patch.object(u.Path,'read_text') as read:
+                with self.assertRaisesRegex(RuntimeError,'program exec pending'):u.health('expected',0)
+                read.assert_not_called()
+        with patch.object(u,'properties',return_value=props),patch.object(u.os,'readlink',return_value=str(u.BINARY)),patch.object(u.Path,'read_text',return_value='Uid:\t0 0 0 0\n'):
+            with self.assertRaisesRegex(AssertionError,'process is root'):u.health('expected',0)
+
     def test_atomic_program_failure_preserves_original_and_success_is_executable(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder);target=root/'program';target.write_bytes(b'old');new=root/'new';new.write_bytes(b'candidate')

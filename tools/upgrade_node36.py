@@ -61,6 +61,11 @@ def health(expected,since,required_pid=None,hash_binary=True):
     props=properties();pid=int(props.get('MainPID','0'));assert props.get('ActiveState')=='active' and props.get('SubState')=='running' and pid>0,'service inactive'
     assert props.get('DynamicUser')=='yes' and props.get('User')!='root','non-root service contract changed'
     if required_pid is not None:assert pid==required_pid,'unexpected process restart'
+    # Type=simple may announce MainPID while systemd's privileged executor is
+    # still preparing its sandbox. Wait for exec before checking program UID;
+    # an actual node program running as root remains a fatal contract failure.
+    if os.readlink(f'/proc/{pid}/exe')!=str(BINARY):
+        raise RuntimeError('program exec pending')
     status={line.split(':',1)[0]:line.split(':',1)[1].strip() for line in Path(f'/proc/{pid}/status').read_text().splitlines() if ':' in line}
     uid=int(status['Uid'].split()[0]);assert uid!=0,'process is root'
     if hash_binary:assert digest(f'/proc/{pid}/exe')==expected,'running program hash mismatch'
