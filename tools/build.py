@@ -54,7 +54,11 @@ def main():
         run(args.go, "build", "-modfile", str(modfile), "-mod=readonly", "-trimpath", "-buildvcs=false", "-tags", lock["build_tags"],
             "-ldflags", "-s -w -X main.version=" + lock["node_version"] + " -X main.buildTime=2026-10-23",
             "-o", str(target), "./cmd/xboard-node", cwd=work, env=dict(env, CGO_ENABLED="0", GOOS="linux", GOARCH=arch))
-    tool_commit=subprocess.check_output(["git","rev-parse","HEAD"],cwd=BASE,text=True).strip()
+    try:
+        top=Path(subprocess.check_output(["git","rev-parse","--show-toplevel"],cwd=BASE,text=True,stderr=subprocess.DEVNULL).strip()).resolve()
+        tool_commit=subprocess.check_output(["git","rev-parse","HEAD"],cwd=BASE,text=True).strip() if top==BASE else None
+    except subprocess.CalledProcessError:
+        tool_commit=None
     manifest = {"tool_commit": tool_commit, "release": lock["release"], "node_version": lock["node_version"], "config_schema": lock["config_schema"],
                 "upstream_commit": lock["upstream_commit"], "upstream": lock["upstream"], "go_version": lock["go_version"],
                 "build_tags": lock["build_tags"], "maintenance_patches": patches, "manager_schema": 1, "dependency_patches": [{**e,"sha256":hashlib.sha256((BASE/"overlays"/e["file"]).read_bytes()).hexdigest()} for e in json.loads((BASE/"overlays/lock.json").read_text())],

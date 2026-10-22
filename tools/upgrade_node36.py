@@ -5,6 +5,7 @@ Never used by xbnode update. No panel writes, credential printing, identity
 creation, service replacement, XrayR enablement, or old-file cleanup.
 """
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -125,6 +126,7 @@ def main():
     assert not BINARY.is_symlink() and digest('/proc/'+props['MainPID']+'/exe')==OLD,'running baseline differs'
     if not a.apply:
         print(json.dumps({'preview':True,'service':UNIT,'old_sha256':OLD,'new_sha256':a.sha256,'release':a.release,'config_files':len(original),'observe_seconds':a.observe_seconds}));return
+    lock=open('/run/lock/xboard-node-36-upgrade.lock','a+');os.chmod(lock.name,0o600);fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     os.umask(0o077);a.folder.mkdir(mode=0o700,parents=False,exist_ok=False)
     archive,old=backup(a.folder,original)
     (a.folder/'baseline-private.json').write_text(json.dumps(original,indent=2))
@@ -134,10 +136,13 @@ def main():
     assert run(str(candidate),'-v').startswith('xboard-node '+a.version+' '),'candidate version mismatch'
     # Existing synthetic client and public fixture only, inside a fresh network
     # namespace with no route to the production panel or client network.
-    command=['unshare','--net','--','sh','-c','ip link set lo up; exec "$@"','node36-compat','python3',str(a.fixture),'--namespace','--binary',str(candidate),'--client',str(a.client),'--only','vless','--reality']
-    test=subprocess.run(command,text=True,capture_output=True,timeout=150)
+    shutil.copyfile(a.client,a.folder/'xray-test-client');(a.folder/'xray-test-client').chmod(0o700)
+    env=dict(os.environ,NODE_PROBE_ROOT=str(a.folder),NODE_PROBE_BINARY=candidate.name,NODE_PROBE_REALITY='1')
+    command=['unshare','--net','--','python3',str(a.fixture)]
+    test=subprocess.run(command,text=True,capture_output=True,timeout=150,env=env)
     (a.folder/'isolated-compat.log').write_text(test.stdout+test.stderr)
-    assert test.returncode==0 and '"pass": true' in test.stdout,'isolated REALITY/Vision compatibility failed'
+    assert test.returncode==0,'isolated REALITY/Vision process failed'
+    compatibility=json.loads(test.stdout.strip().splitlines()[-1]);assert compatibility.get('pass') is True and compatibility.get('reality_vision') is True,'isolated REALITY/Vision compatibility failed'
     assert tree_state()==original and digest(BINARY)==OLD,'production changed during preflight'
     replaced=False;switched=time.time();result={'service':UNIT,'release':a.release,'version':a.version,'sha256':a.sha256,'backup':str(archive),'backup_verified':True,'isolated_compat':True,'samples':[]}
     def save(): (a.folder/'result.json').write_text(json.dumps(result,indent=2))
