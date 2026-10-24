@@ -8,6 +8,7 @@ from pathlib import Path
 import ssl
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -237,6 +238,78 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(xb.Error):
             self.manager.terminal = UI("41")
             self.manager.add()
+
+    def test_menu_can_continue_adding_then_return_without_nested_locks(self):
+        self.manager.terminal = UI("1", "41", "42", "0")
+        locked = False
+
+        @contextlib.contextmanager
+        def lock():
+            nonlocal locked
+            self.assertFalse(locked, "the menu must not nest the add lock")
+            locked = True
+            try:
+                yield
+            finally:
+                locked = False
+
+        def confirm(text):
+            if text.startswith("安装节点"):
+                self.assertTrue(locked)
+                return True
+            self.assertFalse(locked, "continuation must not hold the mutation lock")
+            return not xb.node_dir(42).exists()
+
+        self.manager.terminal.confirm = confirm
+        with patch.object(xb, "mutation_lock", lock):
+            self.manager.menu()
+        self.assertEqual(self.states, {"xbnode-41.service", "xbnode-42.service"})
+        self.assertEqual(self.manager.terminal.answers, [])
+
+    def test_add_command_offers_continuation_and_can_finish_after_one_node(self):
+        xb.write_json(xb.ROOT / "settings.json", {"repo": "owner/repo"})
+        with patch.object(sys, "argv", ["xbnode", "add"]), \
+                patch.object(xb, "require_host"), \
+                patch.object(xb, "Manager", return_value=self.manager), \
+                patch.object(xb, "mutation_lock", contextlib.nullcontext), \
+                patch.object(self.manager.terminal, "confirm", side_effect=[True, False]) as confirm:
+            xb.main()
+        self.assertIn("继续", confirm.call_args.args[0])
+        self.assertEqual(self.states, {"xbnode-41.service"})
+        self.assertFalse(xb.node_dir(42).exists())
+
+    def test_cancelled_install_does_not_offer_continuation(self):
+        with patch.object(xb, "mutation_lock", contextlib.nullcontext), \
+                patch.object(self.manager.terminal, "confirm", return_value=False) as confirm:
+            self.manager.add_interactive()
+        self.assertEqual(confirm.call_count, 1)
+        self.assertFalse(self.states)
+        self.assertFalse(xb.node_dir(41).exists())
+
+    def test_second_add_failure_preserves_the_first_node(self):
+        self.manager.terminal = UI("41", "41")
+        with patch.object(xb, "mutation_lock", contextlib.nullcontext):
+            with self.assertRaisesRegex(xb.Error, "已存在"):
+                self.manager.add_interactive()
+        self.assertEqual(self.states, {"xbnode-41.service"})
+        self.assertTrue(xb.read_json(xb.node_dir(41) / "node.json")["last_ready"])
+
+    def test_ending_terminal_at_continuation_keeps_successful_node(self):
+        for end in (xb.Error("终端输入已结束。"), KeyboardInterrupt()):
+            with self.subTest(end=type(end).__name__), \
+                    patch.object(self.manager, "add", return_value=True) as add, \
+                    patch.object(xb, "mutation_lock", contextlib.nullcontext), \
+                    patch.object(self.manager.terminal, "confirm", side_effect=end), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.manager.add_interactive()
+                add.assert_called_once()
+                self.assertIn("已安装的节点保持运行", output.getvalue())
+
+    def test_continuation_confirmation_defaults_to_no(self):
+        terminal = xb.Terminal.__new__(xb.Terminal)
+        with patch.object(terminal, "ask", side_effect=lambda text, default: default) as ask:
+            self.assertFalse(terminal.confirm("继续添加"))
+        self.assertEqual(ask.call_args.args[1], "no")
 
     def test_failed_update_rolls_back_config_unit_and_running_state(self):
         self.manager.add()

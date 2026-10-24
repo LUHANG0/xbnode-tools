@@ -28,7 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "v0.2.1"
+VERSION = "v0.2.2"
 SCHEMA = 1
 PROTOCOLS = {
     "vless": ("VLESS", "xray", "tcp"),
@@ -761,7 +761,7 @@ class Manager:
         port_free(spec["port"], spec["transport"])
         certificate, cert_files = self.choose_certificate(node_id, spec, raw)
         if not self.ui.confirm(f"安装节点 {node_id}，版本 {self.release}"):
-            return
+            return False
         manifest = release_bundle(repo, self.release)
         # A failed first install remains stopped with its config for diagnosis.
         # It is never declared ready merely because systemd accepted 'start'.
@@ -791,6 +791,22 @@ class Manager:
         meta["last_ready"] = True
         write_json(directory / "node.json", meta)
         print(f"节点 {node_id} 安装完成。请放行 {spec['transport']} {spec['port']}；客户端连接和设备上报待实际测试。")
+        return True
+
+    def add_interactive(self):
+        while True:
+            with mutation_lock():
+                if not self.add():
+                    return
+            # Release the mutation lock while the user decides what to do next.
+            try:
+                again = self.ui.confirm("是否继续在本机添加下一个节点（回车结束添加）")
+            except (Error, KeyboardInterrupt):
+                print("\n已结束添加；已安装的节点保持运行。")
+                break
+            if not again:
+                break
+        print("可随时运行 xbnode add 继续添加节点。")
 
     def nodes(self):
         return [read_json(p) for p in sorted(ROOT.glob("node-*/node.json"))]
@@ -1052,8 +1068,11 @@ class Manager:
                 print("选项无效。")
                 continue
             try:
-                with mutation_lock():
-                    actions[choice]()
+                if choice == "1":
+                    self.add_interactive()
+                else:
+                    with mutation_lock():
+                        actions[choice]()
             except Error as error:
                 print("未完成：" + str(error))
 
@@ -1122,14 +1141,14 @@ def main():
         manager.diagnose(args.node_id, args.service, args.port, args.transport, args.json_output)
     elif args.action == "logs":
         manager.logs(args.node_id)
+    elif args.action == "add":
+        manager.add_interactive()
     else:
         with mutation_lock():
             if args.action == "prune":
                 manager.prune(args.keep_releases, args.keep_snapshots, args.pin, args.apply)
             elif args.action in ("start", "stop", "restart"):
                 manager.control(args.action, args.node_id)
-            elif args.action == "add":
-                manager.add()
             elif args.action == "update":
                 manager.update(args.node_id, args.release)
             elif args.action == "update-all":

@@ -13,7 +13,7 @@ GitHub Actions 构建，程序从自己的 GitHub Releases 下载。
 安装前在面板创建一个新的节点 ID，设置好协议、服务端口、权限组，并至少有一个
 可用用户。零用户时上游不会启动内核，本工具会在安装前说明并停止。
 
-本版本为 [v0.2.1](https://github.com/LUHANG0/xbnode-tools/releases/tag/v0.2.1)；正式安装前先确认该 Release 的两架构资产与 SHA256SUMS 已完整发布。fork 后请先在自己的仓库完成发布，并替换仓库名称：
+本版本为 [v0.2.2](https://github.com/LUHANG0/xbnode-tools/releases/tag/v0.2.2)；正式安装前先确认该 Release 的两架构资产与 SHA256SUMS 已完整发布。fork 后请先在自己的仓库完成发布，并替换仓库名称：
 
 ```bash
 # Debian / Ubuntu，root 执行
@@ -29,6 +29,11 @@ bash /root/install-xbnode.sh --repo LUHANG0/xbnode-tools
 安装器验证管理脚本和发布清单的 SHA-256，然后安装 `xbnode` 命令。
 菜单选择「添加节点」，按提示选择/填写 HTTPS 面板根地址、隐藏输入服务器通讯
 密钥、填写新节点数字 ID。面板地址不带 `/admin` 或 `#/` 后台路径。
+
+从菜单或 `xbnode add` 添加成功后，会询问是否继续添加下一个节点；输入 `yes`
+继续，直接回车结束添加。继续时可选择已保存的面板，无需重复填写通讯密钥。
+结束后，菜单入口返回主菜单，`xbnode add` 返回命令行；也可随时再次执行
+`xbnode add`。取消或失败时不会自动继续，已成功添加的节点保留。
 
 系统没有 systemd、主机架构不支持、端口冲突、面板认证失败、协议不支持或缺少
 必要 REALITY 参数时，会显示错误并停止；不会自动停掉 XrayR 或占用端口的程序。
@@ -48,8 +53,8 @@ xbnode logs 41            # 最近 60 行，已对已知通讯密钥和认证 UR
 xbnode restart 41
 xbnode stop 41
 xbnode start 41
-xbnode update 41 --release v0.2.1
-xbnode update-all --release v0.2.1   # 逐个更新，首个失败即停止后续操作
+xbnode update 41 --release v0.2.2
+xbnode update-all --release v0.2.2   # 逐个更新，首个失败即停止后续操作
 xbnode rollback 41
 xbnode diagnose 41 --json # 本机诊断，缺失数据为 null
 xbnode prune              # 旧程序与快照清理预览
@@ -113,10 +118,12 @@ python3 xbnode.py diagnose --service xboard-node-36.service --port 30000 --trans
 
 清理默认只预览，默认至少保留最近 2 个版本、每节点最近 3 份快照；可用 `--keep-releases`、`--keep-snapshots`、重复的 `--pin vX.Y.Z` 或 settings.json 的 `pinned_releases` 调整保护。运行程序、服务文件、当前配置及所有快照中的回退引用始终优先保护，引用链可能使保留量高于给定数量。读取不完整/引用异常时停止或保护全部版本，不跟随管理目录外的符号链接。只清理本工具的程序/快照，不处理运行状态、证书或业务数据；本轮没有在生产清理历史文件。
 
-已用旧版管理器安装的节点，先更新到新版管理器以获得诊断/清理入口；原管理器仍可执行单节点程序升级：
+已安装管理器的机器，可重新运行上面的安装命令更新管理器，以获得连续添加入口；
+该步骤不更新或重启已有节点。节点程序仍为 `v1.13-maint-20261023.3`，
+无需为了连续添加功能升级已有节点程序。需要单独更新节点时执行：
 
 ```bash
-xbnode update 41 --release v0.2.1
+xbnode update 41 --release v0.2.2
 ```
 
 原配置、凭据、证书及失败/中断恢复保持。该命令只操作 `xbnode-ID.service`；手工部署的 36 号服务需要独立备份和受控替换，不自动接管。
@@ -125,7 +132,7 @@ xbnode update 41 --release v0.2.1
 
 1. 将整个目录（含 `.github`、`.gitignore`）上传到一个独立公开仓库根目录。
 2. 默认分支使用 `main`。代码推送触发管理器测试。
-3. 创建并推送未使用的标签 `v0.2.1`。Actions 会校验固定源码、应用补丁、跑 Go 竞态测试，
+3. 创建并推送未使用的标签 `v0.2.2`。Actions 会校验固定源码、应用补丁、跑 Go 竞态测试，
    构建 AMD64/ARM64，并在无外网容器内跑七协议的合成客户端请求、同 IP 继续连接、
    新 IP 超额拒绝和断开后名额复用，另有真实 UDP 目标、用户重排/撤销/UUID 更换、mux/XUDP 与 REALITY+Vision。
 4. 检查 `Build and publish xbnode` 全部成功，Release 出现后才使用安装命令。
