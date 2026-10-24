@@ -5,13 +5,13 @@ set +x
 set -Eeuo pipefail
 umask 077
 xb_repo="${XBN_REPO:-}"
-xb_release="v0.2.2"
+xb_release="v0.2.3"
 while (($#)); do
   case "$1" in
     --repo) xb_repo="${2:?--repo 需要 OWNER/REPO}"; shift 2 ;;
     --version) xb_release="${2:?--version 需要版本号}"; shift 2 ;;
     -h|--help)
-      printf '%s\n' '用法：sudo bash install.sh --repo OWNER/REPO [--version v0.2.2]'
+      printf '%s\n' '用法：sudo bash install.sh --repo OWNER/REPO [--version v0.2.3]'
       printf '%s\n' '仓库需先发布包含 xbnode.py、manifest.json、SHA256SUMS 的公开 Release。'
       exit 0 ;;
     *) printf '未知参数：%s\n' "$1" >&2; exit 2 ;;

@@ -11,6 +11,7 @@ import datetime as dt
 import fcntl
 import getpass
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -28,7 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "v0.2.2"
+VERSION = "v0.2.3"
 SCHEMA = 1
 PROTOCOLS = {
     "vless": ("VLESS", "xray", "tcp"),
@@ -636,9 +637,11 @@ def retention_plan(keep_releases=2, keep_snapshots=3, pins=(), proc=Path('/proc'
 class Terminal:
     def __init__(self):
         try:
-            self.tty = open("/dev/tty", "r+", encoding="utf-8")
+            # BufferedRandom (used by open(..., "r+")) requires a seekable
+            # stream. A terminal is not seekable; wrap its raw descriptor.
+            self.tty = io.TextIOWrapper(io.FileIO("/dev/tty", "r+"), encoding="utf-8", write_through=True)
         except OSError:
-            raise Error("交互操作需要终端。请下载脚本后用 bash install.sh 运行。") from None
+            raise Error("无法打开控制终端 /dev/tty。请在 SSH/控制台终端中运行 bash /root/install-xbnode.sh；远程执行单条命令时请使用 ssh -t 分配终端。") from None
 
     def ask(self, text, default="", secret=False):
         if secret:
@@ -703,7 +706,9 @@ class Manager:
     def choose_certificate(self, node_id, spec, raw):
         if not spec["needs_cert"]:
             return {"cert_mode": "none"}, None
-        print("该节点需要 TLS 证书：1. 已有证书  2. HTTP-01 自动签发与续期")
+        print("该节点需要 TLS 证书")
+        print("1. 已有证书")
+        print("2. HTTP-01 自动签发与续期")
         choice = self.ui.ask("证书方式", "1")
         if choice == "1":
             cert = Path(self.ui.ask("证书 PEM 文件绝对路径"))
@@ -745,7 +750,12 @@ class Manager:
         raw = panel_read(profile, node_id, "config")
         spec = node_spec(raw)
         count = users_count(panel_read(profile, node_id, "user"))
-        print(f"识别：{spec['label']} / {spec['kernel']} / {spec['port']} {spec['transport']}，可用用户 {count}")
+        print("\n识别到节点配置")
+        print(f"协议：{spec['label']}")
+        print(f"内核：{spec['kernel']}")
+        print(f"端口：{spec['port']}")
+        print(f"传输：{spec['transport']}")
+        print(f"可用用户：{count}")
         if count == 0:
             raise Error("当前可用用户为 0，内核不会监听；请在后台配置权限组/套餐后重试，尚未安装。")
         return raw, spec
@@ -819,12 +829,21 @@ class Manager:
         return meta
 
     def show(self):
-        print("\nID       协议         端口/传输       程序版本                 状态")
-        for meta in self.nodes():
+        print("\n节点列表")
+        nodes = self.nodes()
+        if not nodes:
+            print("暂无由本工具管理的节点。")
+        for meta in nodes:
             state = "运行中" if active(meta["node_id"]) else ("已停止" if meta.get("installed") else "已卸载/保留配置")
             spec = meta["spec"]
-            print(f"{meta['node_id']:<8} {spec['label']:<12} {spec['port']}/{spec['transport']:<9} {meta['release']:<24} {state}")
-        print("服务状态不等于客户端可用性；上线后需实际连接验证。")
+            print(f"\n节点 ID：{meta['node_id']}")
+            print(f"协议：{spec['label']}")
+            print(f"端口：{spec['port']}")
+            print(f"传输：{spec['transport']}")
+            print(f"工具版本：{meta['release']}")
+            print(f"节点程序：{meta.get('node_version', '未知')}")
+            print(f"状态：{state}")
+        print("\n服务状态不等于客户端可用性；上线后需实际连接验证。")
 
     def update(self, node_id=None, release=None, confirmed=False):
         meta = self.select_node(node_id)
@@ -957,7 +976,11 @@ class Manager:
 
     def control(self, action=None, node_id=None):
         meta = self.select_node(node_id)
-        action = action or self.ui.ask("操作：start / stop / restart", "restart")
+        if not action:
+            print("start：启动")
+            print("stop：停止")
+            print("restart：重启")
+            action = self.ui.ask("操作", "restart")
         if action not in ("start", "stop", "restart"):
             raise Error("服务操作无效。")
         since = time.time()
@@ -1055,9 +1078,19 @@ class Manager:
     def menu(self):
         while True:
             self.show()
-            print("\n1. 添加节点  2. 脱敏日志  3. 启停/重启  4. 更新指定节点")
-            print("5. 回退版本  6. 修改节点连接  7. 卸载/保留配置  8. 恢复保留节点  0. 退出")
-            print("9. 依次更新全部节点（失败即停）  10. 更新 TLS 证书  11. 本机诊断  12. 清理预览")
+            print("\n1. 添加节点")
+            print("2. 脱敏日志")
+            print("3. 启停/重启")
+            print("4. 更新指定节点")
+            print("5. 回退版本")
+            print("6. 修改节点连接")
+            print("7. 卸载/保留配置")
+            print("8. 恢复保留节点")
+            print("9. 依次更新全部节点（失败即停）")
+            print("10. 更新 TLS 证书")
+            print("11. 本机诊断")
+            print("12. 清理预览")
+            print("0. 退出")
             choice = self.ui.ask("请选择", "0")
             if choice == "0":
                 return

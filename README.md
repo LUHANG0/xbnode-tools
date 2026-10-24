@@ -13,7 +13,7 @@ GitHub Actions 构建，程序从自己的 GitHub Releases 下载。
 安装前在面板创建一个新的节点 ID，设置好协议、服务端口、权限组，并至少有一个
 可用用户。零用户时上游不会启动内核，本工具会在安装前说明并停止。
 
-本版本为 [v0.2.2](https://github.com/LUHANG0/xbnode-tools/releases/tag/v0.2.2)；正式安装前先确认该 Release 的两架构资产与 SHA256SUMS 已完整发布。fork 后请先在自己的仓库完成发布，并替换仓库名称：
+本版本为 [v0.2.3](https://github.com/LUHANG0/xbnode-tools/releases/tag/v0.2.3)；正式安装前先确认该 Release 的两架构资产与 SHA256SUMS 已完整发布。fork 后请先在自己的仓库完成发布，并替换仓库名称：
 
 ```bash
 # Debian / Ubuntu，root 执行
@@ -35,6 +35,11 @@ bash /root/install-xbnode.sh --repo LUHANG0/xbnode-tools
 结束后，菜单入口返回主菜单，`xbnode add` 返回命令行；也可随时再次执行
 `xbnode add`。取消或失败时不会自动继续，已成功添加的节点保留。
 
+菜单每行一个选项，节点列表和安装识别信息按字段竖排，证书方式与启停选项也逐行显示。
+若旧版报「交互操作需要终端」，请重新下载并运行安装入口更新到 v0.2.3。
+脚本下载路径是 `/root/install-xbnode.sh`，可用 `bash /root/install-xbnode.sh --repo LUHANG0/xbnode-tools`
+重新运行。真实无控制终端的 SSH 单条远程命令需分配终端，例如使用 `ssh -t`。
+
 系统没有 systemd、主机架构不支持、端口冲突、面板认证失败、协议不支持或缺少
 必要 REALITY 参数时，会显示错误并停止；不会自动停掉 XrayR 或占用端口的程序。
 安装失败的本工具服务会停用，配置保留排查。
@@ -53,8 +58,8 @@ xbnode logs 41            # 最近 60 行，已对已知通讯密钥和认证 UR
 xbnode restart 41
 xbnode stop 41
 xbnode start 41
-xbnode update 41 --release v0.2.2
-xbnode update-all --release v0.2.2   # 逐个更新，首个失败即停止后续操作
+xbnode update 41 --release v0.2.3
+xbnode update-all --release v0.2.3   # 逐个更新，首个失败即停止后续操作
 xbnode rollback 41
 xbnode diagnose 41 --json # 本机诊断，缺失数据为 null
 xbnode prune              # 旧程序与快照清理预览
@@ -123,7 +128,7 @@ python3 xbnode.py diagnose --service xboard-node-36.service --port 30000 --trans
 无需为了连续添加功能升级已有节点程序。需要单独更新节点时执行：
 
 ```bash
-xbnode update 41 --release v0.2.2
+xbnode update 41 --release v0.2.3
 ```
 
 原配置、凭据、证书及失败/中断恢复保持。该命令只操作 `xbnode-ID.service`；手工部署的 36 号服务需要独立备份和受控替换，不自动接管。
@@ -132,7 +137,7 @@ xbnode update 41 --release v0.2.2
 
 1. 将整个目录（含 `.github`、`.gitignore`）上传到一个独立公开仓库根目录。
 2. 默认分支使用 `main`。代码推送触发管理器测试。
-3. 创建并推送未使用的标签 `v0.2.2`。Actions 会校验固定源码、应用补丁、跑 Go 竞态测试，
+3. 创建并推送未使用的标签 `v0.2.3`。Actions 会校验固定源码、应用补丁、跑 Go 竞态测试，
    构建 AMD64/ARM64，并在无外网容器内跑七协议的合成客户端请求、同 IP 继续连接、
    新 IP 超额拒绝和断开后名额复用，另有真实 UDP 目标、用户重排/撤销/UUID 更换、mux/XUDP 与 REALITY+Vision。
 4. 检查 `Build and publish xbnode` 全部成功，Release 出现后才使用安装命令。
