@@ -10,8 +10,14 @@
 - 全部使用临时目录、合成面板及模拟 systemd；未连接生产服务器或真实面板。
 - `bash -n install.sh`、`git diff --check` 通过。
 
-标签流水线及公开资产的实际核验结果在完成后补充。下方 v0.2.1 记录保留其原范围，
-不将历史生产观察冒充本次部署或验收。
+[v0.2.2 标签流水线 40124023701](https://github.com/LUHANG0/xbnode-tools/actions/runs/40124023701)
+已全部成功，包含 Linux 48 项检查、九包竞态和双架构七协议/UDP、mux/XUDP、
+REALITY/Vision 合成客户端矩阵。标签提交为 `5d381594c9d85c3fbdebbd9b0ab260bb3eda20eb`。
+
+已实际下载公开 SHA256SUMS 及其中 8 个资产，全部摘要匹配；管理器与安装脚本
+逐字节等于标签源码，manifest 的 release/tool_commit 匹配标签。两架构节点程序
+SHA-256 与下方 v0.2.1 冻结摘要完全一致。未连接或升级任何生产节点。
+下方 v0.2.1 记录保留其原范围，不将历史生产观察冒充本次部署或验收。
 
 # v0.2.1 验证记录
 
